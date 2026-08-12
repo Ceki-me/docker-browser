@@ -1,0 +1,50 @@
+# Publishes the provider image to Docker Hub when a GitHub Release is published.
+#
+# This workflow is intentionally NOT triggered on push — it only runs on
+# `release: published`, so a plain push/PR never publishes the image.
+#
+# Docker Hub secrets required in the repo: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN.
+
+name: docker-publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The image bundles the browser-extension dist. For a release the dist is
+      # expected to be attached to the release as `extension.zip`; adjust the
+      # source if you publish it differently (e.g. built in CI from the
+      # browser-extension repo and uploaded as a workflow artifact).
+      - name: Stage extension dist
+        run: |
+          mkdir -p extension
+          curl -sL -o /tmp/extension.zip \
+            "https://github.com/Ceki-me/browser-extension/releases/download/${GITHUB_REF_NAME}/extension.zip"
+          unzip -q -o /tmp/extension.zip -d extension
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ceki/provider:latest
+            ceki/provider:${{ github.event.release.tag_name }}

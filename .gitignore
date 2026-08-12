@@ -1,0 +1,10 @@
+# Staged extension dist (built by ./build.sh, never committed).
+extension/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/

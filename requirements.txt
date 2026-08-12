@@ -1,0 +1,3 @@
+# Pinned for the docker image (see pyproject.toml for the package metadata).
+ceki-sdk==2.36.1
+playwright>=1.40
