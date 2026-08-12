@@ -22,6 +22,8 @@ Environment variables:
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -53,6 +55,10 @@ _CHROME_ARGS = [
     "--no-sandbox",
     "--disable-gpu",
     "--disable-dev-shm-usage",
+    # skip first-run/default-browser prompts: faster, more deterministic cold
+    # start inside a container (fewer surprises on the very first launch)
+    "--no-first-run",
+    "--no-default-browser-check",
     # self-fingerprint quality fixes:
     # fake media devices make AudioContext non-empty (removes the
     # "Audio context empty (headless indicator)" consistency penalty)
@@ -304,13 +310,77 @@ def _ensure_timezone() -> None:
     log.info("provider timezone: %s", tz)
 
 
-def _discover_ext_id(context: Any, wait_s: float = 15.0) -> str | None:
+def _ext_id_from_manifest(ext_dir: str) -> str | None:
+    """Deterministic extension ID for an unpacked extension with a public ``key``.
+
+    Chrome derives the ID of an unpacked extension from the DER-encoded public
+    key in ``manifest.json``: ``sha256(key)`` → first 16 bytes → each hex nibble
+    mapped to ``a``..``p`` (32 chars). Computing it up front removes the flaky
+    service-worker timing race entirely. Returns ``None`` when the manifest has
+    no ``key`` (then the caller falls back to runtime discovery).
+    """
+    try:
+        manifest = json.loads((Path(ext_dir) / "manifest.json").read_text())
+        key = manifest.get("key")
+        if not key:
+            return None
+        digest = hashlib.sha256(base64.b64decode(key)).hexdigest()[:32]
+        return "".join(chr(ord("a") + int(c, 16)) for c in digest)
+    except Exception as exc:
+        log.warning("could not derive ext id from manifest key: %s", exc)
+        return None
+
+
+def _discover_ext_id(
+    context: Any,
+    wait_s: float = 45.0,
+    expected: str | None = None,
+) -> str | None:
+    """Find the loaded extension ID.
+
+    When ``expected`` is known (from the manifest key) we accept any extension
+    target (service worker **or** page) that matches it.  The reliable trigger
+    is opening the extension panel page: a ``chrome-extension://`` page target
+    appears the moment the extension is *registered* by Chromium, which happens
+    well before the background service worker *starts* (the slow, timing-flaky
+    part on a cold first launch).  Without ``expected`` we fall back to
+    scanning every target's URL for any extension id.
+    """
     deadline = time.time() + wait_s
+    last_force = 0.0
     while time.time() < deadline:
-        for sw in context.service_workers:
-            m = re.search(r"chrome-extension://([a-z]+)/", sw.url)
-            if m:
+        for target in list(context.service_workers) + list(context.pages):
+            m = re.search(r"chrome-extension://([a-z]+)/", target.url)
+            if m and (expected is None or m.group(1) == expected):
                 return m.group(1)
+        # Force-activate: opening the panel creates a matching page target as
+        # soon as the extension is registered.  Throttled — no point spamming
+        # the browser while the profile is still spinning up.
+        if expected and time.time() - last_force >= 3.0:
+            last_force = time.time()
+            page = None
+            opened = False
+            try:
+                page = context.new_page()
+                for path in ("panel/index.html", "panel.html", "popup.html"):
+                    try:
+                        page.goto(
+                            f"chrome-extension://{expected}/{path}",
+                            wait_until="domcontentloaded",
+                            timeout=4000,
+                        )
+                        opened = True
+                        break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            finally:
+                if page is not None and not opened:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
         time.sleep(1)
     return None
 
@@ -392,16 +462,34 @@ def _launch_provider(
             ignore_https_errors=True,
         )
 
+    # Derive the expected extension ID from the manifest public key up front:
+    # deterministic, so we never depend on the (timing-flaky) service-worker
+    # registration to learn the ID.
+    expected_id = _ext_id_from_manifest(ext_dir)
+    log.info("two-launch: expected extension id from manifest key: %s", expected_id)
+
     # Two-launch: install the extension, grant incognito access post-install
     # (the preseeded Preferences are overwritten by Chromium on install), then
     # relaunch with incognito permission persisted in the profile.
     log.info("two-launch: install phase")
     c1 = launch()
-    ext_id = _discover_ext_id(c1)
+    ext_id = _discover_ext_id(c1, expected=expected_id)
     c1.close()
     if not ext_id:
-        shutil.rmtree(profile_dir, ignore_errors=True)
-        raise ProviderError("Could not discover extension ID in install phase")
+        if expected_id:
+            # The ID is deterministic from the manifest key, so a slow SW
+            # registration on a cold first launch must not kill the whole
+            # two-launch flow.  Proceed with the known ID; the run phase
+            # re-confirms the extension is actually live.
+            log.warning(
+                "install phase: extension target not seen within 45s; "
+                "proceeding with deterministic id %s (re-confirmed at run phase)",
+                expected_id,
+            )
+            ext_id = expected_id
+        else:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            raise ProviderError("Could not discover extension ID in install phase")
 
     try:
         prefs_path = default_dir / "Preferences"
@@ -416,11 +504,11 @@ def _launch_provider(
         log.warning("two-launch: Preferences edit failed: %s", exc)
 
     browser_context = launch()
-    discovered = _discover_ext_id(browser_context)
+    discovered = _discover_ext_id(browser_context, expected=expected_id, wait_s=60.0)
     if discovered:
         ext_id = discovered
-    if discovered != DEFAULT_EXT_ID:
-        log.warning("extension id %s differs from expected %s", discovered, DEFAULT_EXT_ID)
+    if discovered != expected_id:
+        log.warning("extension id %s differs from expected %s", discovered, expected_id)
 
     # Headless hosts have no UI toggle for incognito access — force it on.
     if browser_context.service_workers:
