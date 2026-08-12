@@ -23,6 +23,44 @@ if [ -z "${DISPLAY:-}" ]; then
   export DISPLAY=:99
 fi
 
+# --- Runtime environment override for the bundled extension config -----------
+# The extension is static JS: it cannot read container env, so the environment
+# is baked into the built bundle at build time.  The image ships with PROD URLs
+# (wss://browser.ceki.me/ws/provider, https://api.ceki.me) and defaults to prod.
+# To point the extension at another environment (e.g. the dev stand) without
+# building a separate image, set CEKI_WS_URL / CEKI_API_URL: the full URL
+# strings are replaced in the bundled JS before Chromium starts.  The provider
+# launcher already reads CEKI_API_URL for its own API base (token handshake),
+# so both stay consistent.
+#
+#   docker run -e CEKI_WS_URL=wss://browser.ittribe.org/ws/provider \
+#              -e CEKI_API_URL=https://clawapi.ittribe.org \
+#              -e CEKI_PROVIDER_TOKEN=<token> ceki/provider:latest
+
+EXT_DIR="${CEKI_PROVIDER_EXT_DIR:-/opt/ceki/extension}"
+DEFAULT_WS_URL="wss://browser.ceki.me/ws/provider"
+DEFAULT_API_URL="https://api.ceki.me"
+
+patch_extension_urls() {
+  [ -d "$EXT_DIR" ] || return 0
+  files="$(grep -rlE "${DEFAULT_WS_URL}|${DEFAULT_API_URL}" "$EXT_DIR" --include='*.js' 2>/dev/null || true)"
+  [ -n "$files" ] || return 0
+  if [ -n "${CEKI_WS_URL:-}" ] && [ "$CEKI_WS_URL" != "$DEFAULT_WS_URL" ]; then
+    for f in $files; do
+      sed -i "s|${DEFAULT_WS_URL}|${CEKI_WS_URL}|g" "$f"
+    done
+    echo "[ceki-provider] extension: relay WS  ${DEFAULT_WS_URL} -> ${CEKI_WS_URL}"
+  fi
+  if [ -n "${CEKI_API_URL:-}" ] && [ "$CEKI_API_URL" != "$DEFAULT_API_URL" ]; then
+    for f in $files; do
+      sed -i "s|${DEFAULT_API_URL}|${CEKI_API_URL}|g" "$f"
+    done
+    echo "[ceki-provider] extension: api URL  ${DEFAULT_API_URL} -> ${CEKI_API_URL}"
+  fi
+}
+
+patch_extension_urls
+
 # Start Xvfb if it is not already up on our display.
 if ! xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
   echo "[ceki-provider] starting Xvfb on ${DISPLAY}"

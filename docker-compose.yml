@@ -16,12 +16,17 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ceki/provider:dev
+    image: ceki/provider:latest
     environment:
       # REQUIRED: the one-time browser token from your account dashboard.
       # The container starts and stops with a clear error if this is unset.
       - CEKI_PROVIDER_TOKEN=${CEKI_PROVIDER_TOKEN:-}
-      # Optional: override the API base URL (defaults to https://api.ceki.me).
+      # Runtime environment override (see entrypoint.sh): the extension bundle
+      # ships with PROD URLs and stays prod unless these are set. Point them at
+      # the dev stand to run a dev browser without a separate image:
+      #   CEKI_WS_URL=wss://browser.ittribe.org/ws/provider
+      #   CEKI_API_URL=https://clawapi.ittribe.org
+      - CEKI_WS_URL=${CEKI_WS_URL:-}
       - CEKI_API_URL=${CEKI_API_URL:-}
       # Inherit the host timezone so the provider browser's local time matches
       # the IP geolocation (self-fingerprint consistency).

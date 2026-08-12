@@ -49,9 +49,30 @@ docker compose stop provider
 | Env var | Default | Description |
 |---|---|---|
 | `CEKI_PROVIDER_TOKEN` | — | **Required.** One-time browser token from your dashboard. |
-| `CEKI_API_URL` | `https://api.ceki.me` | API base URL. |
+| `CEKI_WS_URL` | `wss://browser.ceki.me/ws/provider` | Relay WebSocket URL. Overrides the PROD URL baked into the extension bundle at runtime (see below). |
+| `CEKI_API_URL` | `https://api.ceki.me` | API base URL — used by the launcher (token handshake) and substituted into the extension bundle at runtime. |
 | `DISPLAY` | `:99` | X display for the virtual screen. |
 | `TZ` | host timezone | Browser timezone (keeps it consistent with your location). |
+
+### One image, environment at runtime
+
+The image ships with the **PROD** environment baked in and defaults to prod.
+The extension is static JS and cannot read container env, so the entrypoint
+replaces the PROD URL strings in the bundled extension config before Chromium
+starts when the env is set (and differs from the default). No separate dev
+image is needed (`ceki/provider:dev` is deprecated).
+
+```bash
+# prod (default) — no env needed beyond the token
+docker run --rm -e CEKI_PROVIDER_TOKEN=<your-token> ceki/provider
+
+# dev stand — override the relay + API URLs
+docker run --rm \
+  -e CEKI_PROVIDER_TOKEN=<your-token> \
+  -e CEKI_WS_URL=wss://browser.ittribe.org/ws/provider \
+  -e CEKI_API_URL=https://clawapi.ittribe.org \
+  ceki/provider
+```
 
 ## Stopping / cleanup
 
@@ -68,7 +89,7 @@ from a local copy of the extension before running `docker build`:
 ./build.sh /path/to/browser-extension/dist
 ```
 
-This produces the `ceki/provider:dev` image locally. The published image on
+This produces the `ceki/provider:latest` image locally. The published image on
 Docker Hub is built automatically from tagged releases.
 
 ## Notes
