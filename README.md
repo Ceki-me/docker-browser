@@ -31,8 +31,14 @@ stop the container.
 
 ### With docker compose
 
+> The image bundles the browser-extension dist, which must be staged **before**
+> building. Run `./build.sh` first (it copies the extension dist into the
+> git-ignored `extension/` directory). If you skip this, `docker compose
+> up --build` fails at the `COPY extension/` step.
+
 ```bash
 export CEKI_PROVIDER_TOKEN=<your-token>
+./build.sh                          # stage the extension dist first (required)
 docker compose up -d --build
 docker compose logs -f provider
 docker compose stop provider
