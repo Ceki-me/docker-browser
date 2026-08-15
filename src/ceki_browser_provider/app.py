@@ -75,9 +75,15 @@ VIEWPORT_WIDTH, VIEWPORT_HEIGHT = _parse_viewport(os.environ.get("CEKI_PROVIDER_
 # incognito access to the unpacked extension in the Chromium profile.
 DEFAULT_EXT_ID = "gfionhbdkojjnjpbhlblopoaecdpllhb"
 
+# Base Chromium args shared by every launch. The extension is NOT loaded via
+# --load-extension here: it is installed by Chrome itself from the external
+# update policy (/usr/share/chromium/extensions/<id>.json → external_update_url),
+# which makes Chrome auto-update it in the background (checks the update channel
+# every few hours) — so a long-running provider container stays on the latest
+# extension build without ever restarting. The unpacked --load-extension path
+# is kept as a fallback (see _launch_provider) for offline / local runs where
+# no external channel is reachable.
 _CHROME_ARGS = [
-    "--disable-extensions-except={ext_dir}",
-    "--load-extension={ext_dir}",
     "--no-sandbox",
     "--disable-gpu",
     "--disable-dev-shm-usage",
@@ -94,6 +100,21 @@ _CHROME_ARGS = [
     "--disable-blink-features=AutomationControlled",
     # deterministic, consistent accept-language/locale
     "--lang=en-US",
+]
+
+# Unpacked-extension flags, appended only in the fallback launch path.
+_LOAD_EXT_ARGS = [
+    "--disable-extensions-except={ext_dir}",
+    "--load-extension={ext_dir}",
+]
+
+# Where Chrome looks for an external-extension policy (unbranded Chromium):
+# the JSON file named <extension-id>.json with an external_update_url.
+_EXTERNAL_POLICY_DIRS = [
+    "/usr/share/chromium/extensions",
+    "/etc/chromium/extensions",
+    "/usr/share/chrome/extensions",
+    "/etc/opt/chrome/extensions",
 ]
 
 # JS helpers injected into the extension panel page.  ``arg`` is supplied by
@@ -282,7 +303,13 @@ def _setup_logging(verbose: bool = False) -> None:
     logger = logging.getLogger("ceki.provider")
     logger.handlers.clear()
     logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    level = os.environ.get("CEKI_PROVIDER_LOG_LEVEL", "").upper()
+    if verbose or level == "DEBUG":
+        logger.setLevel(logging.DEBUG)
+    elif level:
+        logger.setLevel(getattr(logging, level, logging.INFO))
+    else:
+        logger.setLevel(logging.INFO)
     logger.propagate = False
 
 
@@ -334,6 +361,38 @@ def _ensure_timezone() -> None:
     except Exception:
         pass
     log.info("provider timezone: %s", tz)
+
+
+def _external_policy_update_url() -> str | None:
+    """Return the ``external_update_url`` of the external-extension policy, if any.
+
+    Chrome installs and auto-updates an extension from a JSON policy file named
+    ``<extension-id>.json`` placed in a policy directory (e.g.
+    ``/usr/share/chromium/extensions/``). When such a policy exists we launch
+    Chromium without ``--load-extension`` and let Chrome itself install the
+    extension from the update channel — which also means Chrome keeps updating
+    it in the background (checks every few hours), the point of this whole mode.
+
+    Returns ``None`` when no policy is found (then the launcher falls back to
+    the unpacked ``--load-extension`` path).
+    """
+    for d in _EXTERNAL_POLICY_DIRS:
+        p = Path(d)
+        if not p.is_dir():
+            continue
+        try:
+            for f in p.glob("*.json"):
+                try:
+                    data = json.loads(f.read_text())
+                except Exception:
+                    continue
+                url = data.get("external_update_url")
+                if isinstance(url, str) and url:
+                    log.info("external extension policy: %s -> %s", f, url)
+                    return url
+        except OSError:
+            continue
+    return None
 
 
 def _ext_id_from_manifest(ext_dir: str) -> str | None:
@@ -403,12 +462,30 @@ def _discover_ext_id(
                 pass
             finally:
                 if page is not None and not opened:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
+                    _close_blocked_page(page)
         time.sleep(1)
     return None
+
+
+def _close_blocked_page(page: Any) -> None:
+    """Close a probe page without deadlocking.
+
+    A ``chrome-extension://`` navigation that fails with ERR_BLOCKED_BY_CLIENT
+    (extension installed by the external policy but not yet enabled in this
+    browser session) leaves the page's load stuck; ``page.close()`` then blocks
+    forever waiting for that load to finish.  Navigating to ``about:blank``
+    first aborts the stuck load so ``close()`` returns immediately.  The
+    ``about:blank`` goto itself may fail (interrupted navigation) — that is the
+    point, and it is safe to ignore.
+    """
+    try:
+        page.goto("about:blank", wait_until="domcontentloaded", timeout=1000)
+    except Exception:
+        pass
+    try:
+        page.close()
+    except Exception:
+        pass
 
 
 def _open_panel(browser_context: Any, ext_id: str) -> Any | None:
@@ -423,7 +500,7 @@ def _open_panel(browser_context: Any, ext_id: str) -> Any | None:
             return page
         except Exception:
             continue
-    page.close()
+    _close_blocked_page(page)
     return None
 
 
@@ -477,33 +554,79 @@ def _launch_provider(
     default_dir = Path(profile_dir) / "Default"
     default_dir.mkdir(parents=True, exist_ok=True)
 
-    chrome_args = [a.format(ext_dir=ext_dir) for a in _CHROME_ARGS]
-    # --window-size makes the window deterministic under Xvfb (no WM): without
-    # it the framebuffer size can drift from the requested viewport.
-    chrome_args.append(f"--window-size={VIEWPORT_WIDTH},{VIEWPORT_HEIGHT}")
+    # External-extension mode: a policy JSON (e.g. /usr/share/chromium/extensions/
+    # <id>.json) with an external_update_url is present, so Chrome itself installs
+    # the extension from the update channel and keeps auto-updating it. The
+    # unpacked --load-extension path is only a fallback (offline / no policy).
+    external_url = _external_policy_update_url()
+    load_ext = external_url is None
+    if load_ext:
+        log.info("extension mode: unpacked --load-extension (%s)", ext_dir)
+    else:
+        log.info("extension mode: external update (%s)", external_url)
 
-    def launch() -> Any:
+    def build_chrome_args(use_load_ext: bool) -> list[str]:
+        args = list(_CHROME_ARGS)
+        if use_load_ext:
+            args.extend(a.format(ext_dir=ext_dir) for a in _LOAD_EXT_ARGS)
+        # --window-size makes the window deterministic under Xvfb (no WM):
+        # without it the framebuffer size can drift from the requested viewport.
+        args.append(f"--window-size={VIEWPORT_WIDTH},{VIEWPORT_HEIGHT}")
+        return args
+
+    def launch(use_load_ext: bool) -> Any:
         return chromium.launch_persistent_context(
             profile_dir,
             headless=False,
-            args=chrome_args,
+            args=build_chrome_args(use_load_ext),
+            # Playwright injects a batch of --disable-* args by default, three of
+            # which block the external-update policy install:
+            #   --disable-extensions              — extensions off entirely
+            #   --disable-background-networking   — kills the background update
+            #                                      check that downloads the CRX
+            #   --disable-default-apps            — skips the first-run pass that
+            #                                      installs policy extensions
+            # Drop all three so the external extension is installed and
+            # auto-updated by Chrome itself.
+            ignore_default_args=[
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-default-apps",
+            ],
             viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             ignore_https_errors=True,
         )
 
     # Derive the expected extension ID from the manifest public key up front:
     # deterministic, so we never depend on the (timing-flaky) service-worker
-    # registration to learn the ID.
+    # registration to learn the ID. The external CRX is signed with the same
+    # key as the bundled manifest, so the ID matches either way.
     expected_id = _ext_id_from_manifest(ext_dir)
     log.info("two-launch: expected extension id from manifest key: %s", expected_id)
 
     # Two-launch: install the extension, grant incognito access post-install
     # (the preseeded Preferences are overwritten by Chromium on install), then
     # relaunch with incognito permission persisted in the profile.
-    log.info("two-launch: install phase")
-    c1 = launch()
-    ext_id = _discover_ext_id(c1, expected=expected_id)
+    log.info("two-launch: install phase (load_ext=%s)", load_ext)
+    # External mode: first install downloads the CRX from the update channel,
+    # which on a cold start can take longer than the usual registration wait.
+    c1 = launch(load_ext)
+    ext_id = _discover_ext_id(
+        c1,
+        expected=expected_id,
+        wait_s=90.0 if not load_ext else 45.0,
+    )
     c1.close()
+    if not ext_id and not load_ext:
+        # The external policy existed but the extension did not materialise
+        # (offline channel, unreachable CRX). Fall back to the unpacked copy.
+        log.warning(
+            "external install not seen within 90s; falling back to unpacked --load-extension"
+        )
+        load_ext = True
+        c1 = launch(load_ext)
+        ext_id = _discover_ext_id(c1, expected=expected_id, wait_s=45.0)
+        c1.close()
     if not ext_id:
         if expected_id:
             # The ID is deterministic from the manifest key, so a slow SW
@@ -532,7 +655,7 @@ def _launch_provider(
     except Exception as exc:
         log.warning("two-launch: Preferences edit failed: %s", exc)
 
-    browser_context = launch()
+    browser_context = launch(load_ext)
     discovered = _discover_ext_id(browser_context, expected=expected_id, wait_s=60.0)
     if discovered:
         ext_id = discovered

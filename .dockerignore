@@ -1,0 +1,19 @@
+# VCS / IDE
+.git
+.gitignore
+.github
+*.md
+
+# Staged extension dist is built by build.sh into extension/; keep only the
+# staged files out of the context to reduce its size, but NOT the dir itself
+# (Dockerfile's `COPY extension/` needs it).
+extension/*.zip
+extension/*.crx
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
