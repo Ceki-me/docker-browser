@@ -51,6 +51,7 @@ docker compose stop provider
 | `CEKI_PROVIDER_TOKEN` | — | **Required.** One-time browser token from your dashboard. |
 | `CEKI_WS_URL` | `wss://browser.ceki.me/ws/provider` | Relay WebSocket URL. Overrides the PROD URL baked into the extension bundle at runtime (see below). |
 | `CEKI_API_URL` | `https://api.ceki.me` | API base URL — used by the launcher (token handshake) and substituted into the extension bundle at runtime. |
+| `CEKI_PROVIDER_VIEWPORT` | `1920x1080` | Browser viewport / resolution (WxH). Full HD by default; drives both the Chromium viewport and the Xvfb screen (+120px height margin for full-page screenshots). |
 | `DISPLAY` | `:99` | X display for the virtual screen. |
 | `TZ` | host timezone | Browser timezone (keeps it consistent with your location). |
 

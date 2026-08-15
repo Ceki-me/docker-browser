@@ -45,6 +45,32 @@ from ceki_sdk._config import default_api_url
 
 log = logging.getLogger("ceki.provider")
 
+# Default viewport / resolution. The container is a headless FHD provider, so
+# Full HD is the default; CEKI_PROVIDER_VIEWPORT (WxH) overrides it.
+DEFAULT_VIEWPORT = "1920x1080"
+
+
+def _parse_viewport(raw: str | None) -> tuple[int, int]:
+    """Parse CEKI_PROVIDER_VIEWPORT (format WxH) into (width, height).
+
+    Defaults to 1920x1080. Falls back to the default on unparseable or
+    non-positive input so a bad env value never crashes provider launch.
+    """
+    value = (raw or DEFAULT_VIEWPORT).strip().lower()
+    try:
+        w_s, h_s = value.split("x", 1)
+        w, h = int(w_s), int(h_s)
+    except (ValueError, AttributeError):
+        log.warning("CEKI_PROVIDER_VIEWPORT=%r unparseable, using %s", raw, DEFAULT_VIEWPORT)
+        return 1920, 1080
+    if w <= 0 or h <= 0:
+        log.warning("CEKI_PROVIDER_VIEWPORT=%r invalid size, using %s", raw, DEFAULT_VIEWPORT)
+        return 1920, 1080
+    return w, h
+
+
+VIEWPORT_WIDTH, VIEWPORT_HEIGHT = _parse_viewport(os.environ.get("CEKI_PROVIDER_VIEWPORT"))
+
 # Stable extension id (derived from the public manifest key).  Used to grant
 # incognito access to the unpacked extension in the Chromium profile.
 DEFAULT_EXT_ID = "gfionhbdkojjnjpbhlblopoaecdpllhb"
@@ -452,13 +478,16 @@ def _launch_provider(
     default_dir.mkdir(parents=True, exist_ok=True)
 
     chrome_args = [a.format(ext_dir=ext_dir) for a in _CHROME_ARGS]
+    # --window-size makes the window deterministic under Xvfb (no WM): without
+    # it the framebuffer size can drift from the requested viewport.
+    chrome_args.append(f"--window-size={VIEWPORT_WIDTH},{VIEWPORT_HEIGHT}")
 
     def launch() -> Any:
         return chromium.launch_persistent_context(
             profile_dir,
             headless=False,
             args=chrome_args,
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             ignore_https_errors=True,
         )
 

@@ -61,10 +61,32 @@ patch_extension_urls() {
 
 patch_extension_urls
 
+# --- Viewport / Xvfb screen ---------------------------------------------------
+# CEKI_PROVIDER_VIEWPORT (WxH, default 1920x1080) drives both the Chromium
+# window size / viewport (app.py) and the Xvfb framebuffer, so the virtual
+# screen always matches the rendered resolution. The screen height gets a
+# +120px margin so full-page screenshots that run past the bottom of the
+# viewport are not clipped by the virtual display. Unparseable values fall
+# back to the default.
+CEKI_PROVIDER_VIEWPORT="${CEKI_PROVIDER_VIEWPORT:-1920x1080}"
+case "$CEKI_PROVIDER_VIEWPORT" in
+  *x*) ;;
+  *) CEKI_PROVIDER_VIEWPORT=1920x1080 ;;
+esac
+XVFB_W="${CEKI_PROVIDER_VIEWPORT%x*}"
+XVFB_H_RAW="${CEKI_PROVIDER_VIEWPORT#*x}"
+if ! echo "$XVFB_W" | grep -qE '^[0-9]+$' || ! echo "$XVFB_H_RAW" | grep -qE '^[0-9]+$'; then
+  echo "[ceki-provider] WARN: CEKI_PROVIDER_VIEWPORT='${CEKI_PROVIDER_VIEWPORT}' invalid, using 1920x1080" >&2
+  XVFB_W=1920
+  XVFB_H_RAW=1080
+fi
+XVFB_H="$(( XVFB_H_RAW + 120 ))"
+export CEKI_PROVIDER_VIEWPORT="${XVFB_W}x${XVFB_H_RAW}"
+
 # Start Xvfb if it is not already up on our display.
 if ! xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
-  echo "[ceki-provider] starting Xvfb on ${DISPLAY}"
-  Xvfb "${DISPLAY}" -screen 0 1280x720x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
+  echo "[ceki-provider] starting Xvfb on ${DISPLAY} (screen ${XVFB_W}x${XVFB_H}x24)"
+  Xvfb "${DISPLAY}" -screen 0 "${XVFB_W}x${XVFB_H}x24" -nolisten tcp >/tmp/xvfb.log 2>&1 &
 fi
 
 exec "$@"
