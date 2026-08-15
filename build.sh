@@ -12,11 +12,16 @@
 #   $CEKI_EXT_DIST   (default: ../../browser-extension/dist)
 #
 # Optionally:  ./build.sh /path/to/browser-extension/dist
+#
+# One image: the bundled dist should be a PROD build — PROD URLs are the
+# default at runtime.  Other environments (dev stand) are selected at runtime
+# via CEKI_WS_URL / CEKI_API_URL (see entrypoint.sh).  The separate
+# ceki/provider:dev image is deprecated.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE="${CEKI_IMAGE:-ceki/provider:dev}"
+IMAGE="${CEKI_IMAGE:-ceki/provider:latest}"
 EXT_SRC="${1:-${CEKI_EXT_DIST:-}}"
 
 if [ -z "${EXT_SRC:-}" ]; then
