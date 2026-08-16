@@ -20,16 +20,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # The image bundles the browser-extension dist. For a release the dist is
-      # expected to be attached to the release as `extension.zip`; adjust the
-      # source if you publish it differently (e.g. built in CI from the
-      # browser-extension repo and uploaded as a workflow artifact).
+      # The image bundles the browser-extension dist. The dist is fetched from
+      # the prod host (https://browser.ceki.me/ext/...) — the same bundle the
+      # extension updater serves and the default source ./build.sh uses, so a
+      # CI-built image equals a local-built image. This avoids depending on a
+      # browser-extension release whose asset name/tag must match this repo's
+      # release tag (the old URL could never resolve: no `extension.zip` asset
+      # exists there, and release tags differ between the two repos).
       - name: Stage extension dist
         run: |
+          set -euo pipefail
           mkdir -p extension
-          curl -sL -o /tmp/extension.zip \
-            "https://github.com/Ceki-me/browser-extension/releases/download/${GITHUB_REF_NAME}/extension.zip"
+          curl -fsSL -o /tmp/extension.zip \
+            "https://browser.ceki.me/ext/ceki-browser-extension-latest.zip"
           unzip -q -o /tmp/extension.zip -d extension
+          test -f extension/manifest.json || { \
+            echo "error: downloaded bundle has no manifest.json — not a browser-extension dist" >&2; \
+            exit 1; }
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
