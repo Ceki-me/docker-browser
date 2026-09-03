@@ -1,11 +1,16 @@
 # Publishes the provider image when a GitHub Release is published.
 #
 # This workflow is intentionally NOT triggered on push — it only runs on
-# `release: published`, so a plain push/PR never publishes the image.
+# `release: published` (or manually via workflow_dispatch for a lean
+# republish), so a plain push/PR never publishes the image.
 #
 # Primary target: GitHub Container Registry (GHCR) attached to this repo
 # (ghcr.io/ceki-me/docker-browser). GHCR needs no secrets — the workflow's
 # GITHUB_TOKEN carries packages: write for its own repository.
+#
+# GHCR creates container packages private by default even in a public repo,
+# so after pushing we flip the package visibility to public (the repo-scoped
+# GITHUB_TOKEN may update it) — otherwise anonymous `docker pull` fails.
 #
 # Docker Hub (ceki/provider) push activates automatically once the repo has
 # DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets set; without them the Hub login
@@ -16,6 +21,7 @@ name: docker-publish
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 jobs:
   build-and-push:
@@ -76,14 +82,22 @@ jobs:
       - name: Compute tags
         id: tags
         run: |
+          # latest is always pushed; the release tag (and Hub tags) only exist
+          # on a real Release — on workflow_dispatch there is no tag_name.
           {
             echo "ghcr.io/ceki-me/docker-browser:latest"
-            echo "ghcr.io/ceki-me/docker-browser:${{ github.event.release.tag_name }}"
             if [ "${{ steps.hubcheck.outputs.enabled }}" = "1" ]; then
               echo "ceki/provider:latest"
-              echo "ceki/provider:${{ github.event.release.tag_name }}"
             fi
           } > /tmp/tags
+          if [ -n "${{ github.event.release.tag_name }}" ]; then
+            {
+              echo "ghcr.io/ceki-me/docker-browser:${{ github.event.release.tag_name }}"
+              if [ "${{ steps.hubcheck.outputs.enabled }}" = "1" ]; then
+                echo "ceki/provider:${{ github.event.release.tag_name }}"
+              fi
+            } >> /tmp/tags
+          fi
           {
             echo "tags<<__CEKI_EOF__"
             cat /tmp/tags
@@ -96,3 +110,16 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.tags.outputs.tags }}
+
+      - name: Make GHCR package public
+        # GHCR creates container packages private by default, even in a public
+        # repo, so anonymous `docker pull` is denied until the visibility is
+        # flipped. The repo-scoped GITHUB_TOKEN (packages: write) can update it
+        # for its own repository — flip here so a freshly published image is
+        # always pullable without authentication.
+        run: |
+          curl -sS --fail-with-body -X PUT \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/packages/container/docker-browser/visibility" \
+            -d '{"visibility":"public"}'
