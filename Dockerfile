@@ -23,6 +23,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /opt/ceki
 
+# OCI annotations link the GHCR image to this repository, so the image shows
+# under the repo's Packages tab and Actions' GITHUB_TOKEN can manage it
+# (visibility, deletion). Without a source label the image is orphaned.
+LABEL org.opencontainers.image.source=https://github.com/Ceki-me/docker-browser \
+      org.opencontainers.image.title=ceki-browser-provider \
+      org.opencontainers.image.description="Ceki headless-browser provider image: Chromium + browser extension + provider launcher"
+
 # Chromium runtime libraries + Xvfb virtual display (Chromium needs a display to
 # run as a "visible" provider browser; Xvfb provides it headlessly).
 RUN apt-get update && apt-get install -y --no-install-recommends \
