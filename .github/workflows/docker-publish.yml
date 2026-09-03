@@ -1,9 +1,15 @@
-# Publishes the provider image to Docker Hub when a GitHub Release is published.
+# Publishes the provider image when a GitHub Release is published.
 #
 # This workflow is intentionally NOT triggered on push — it only runs on
 # `release: published`, so a plain push/PR never publishes the image.
 #
-# Docker Hub secrets required in the repo: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN.
+# Primary target: GitHub Container Registry (GHCR) attached to this repo
+# (ghcr.io/ceki-me/docker-browser). GHCR needs no secrets — the workflow's
+# GITHUB_TOKEN carries packages: write for its own repository.
+#
+# Docker Hub (ceki/provider) push activates automatically once the repo has
+# DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets set; without them the Hub login
+# and hub tags are skipped so the job never fails on a missing Hub account.
 
 name: docker-publish
 
@@ -16,35 +22,77 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # The image bundles the browser-extension dist. For a release the dist is
-      # expected to be attached to the release as `extension.zip`; adjust the
-      # source if you publish it differently (e.g. built in CI from the
-      # browser-extension repo and uploaded as a workflow artifact).
+      # The image bundles the browser-extension dist. The dist is fetched from
+      # the prod host (https://browser.ceki.me/ext/...) — the same bundle the
+      # extension updater serves and the default source ./build.sh uses, so a
+      # CI-built image equals a local-built image. This avoids depending on a
+      # browser-extension release asset whose tag would have to match this
+      # repo's release tag (release tags differ between the two repos).
       - name: Stage extension dist
         run: |
+          set -euo pipefail
           mkdir -p extension
-          curl -sL -o /tmp/extension.zip \
-            "https://github.com/Ceki-me/browser-extension/releases/download/${GITHUB_REF_NAME}/extension.zip"
+          curl -fsSL -o /tmp/extension.zip \
+            "https://browser.ceki.me/ext/ceki-browser-extension-latest.zip"
           unzip -q -o /tmp/extension.zip -d extension
+          test -f extension/manifest.json || { \
+            echo "error: downloaded bundle has no manifest.json — not a browser-extension dist" >&2; \
+            exit 1; }
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - id: hubcheck
+        name: Check Docker Hub secrets
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$HUB_USER" ] && [ -n "$HUB_TOKEN" ]; then
+            echo "enabled=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Login to Docker Hub
+        if: steps.hubcheck.outputs.enabled == '1'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          {
+            echo "ghcr.io/ceki-me/docker-browser:latest"
+            echo "ghcr.io/ceki-me/docker-browser:${{ github.event.release.tag_name }}"
+            if [ "${{ steps.hubcheck.outputs.enabled }}" = "1" ]; then
+              echo "ceki/provider:latest"
+              echo "ceki/provider:${{ github.event.release.tag_name }}"
+            fi
+          } > /tmp/tags
+          {
+            echo "tags<<__CEKI_EOF__"
+            cat /tmp/tags
+            echo "__CEKI_EOF__"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            ceki/provider:latest
-            ceki/provider:${{ github.event.release.tag_name }}
+          tags: ${{ steps.tags.outputs.tags }}
