@@ -114,30 +114,44 @@ jobs:
       - name: Make GHCR package public
         # GHCR creates container packages private by default, even in a public
         # repo, so anonymous `docker pull` is denied until the visibility is
-        # flipped. Try the repo-scoped GITHUB_TOKEN first (works once the
-        # account has GitHub Packages enabled); if it 404s, fall back to a
-        # PACKAGES_ADMIN_TOKEN secret (classic PAT with write:packages) when
-        # present. If neither works the job does not fail — it warns, and the
-        # image stays private until someone flips it once in the Packages UI
-        # (a linked package keeps its visibility across later pushes).
+        # flipped. The pushed image lives either repo-scoped or org-scoped
+        # (Ceki-me is an organization) — probe both and PUT visibility=public
+        # on whichever the GITHUB_TOKEN can address. If none works the job does
+        # not fail — it warns, and the image stays private until someone flips
+        # it once in the Packages UI.
         env:
           ADMIN_TOKEN: ${{ secrets.PACKAGES_ADMIN_TOKEN }}
         run: |
           set +e
-          curl -sS --fail-with-body -X PUT \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/packages/container/docker-browser/visibility" \
-            -d '{"visibility":"public"}' \
-            && { echo "GHCR package visibility set to public (GITHUB_TOKEN)"; exit 0; }
-          echo "GITHUB_TOKEN attempt failed (see above)"
-          if [ -n "$ADMIN_TOKEN" ]; then
-            curl -sS --fail-with-body -X PUT \
-              -H "Authorization: Bearer $ADMIN_TOKEN" \
+          ORG="${GITHUB_REPOSITORY_OWNER}"
+          put() {
+            curl -sS -o /tmp/visresp -w '%{http_code}' -X PUT \
+              -H "Authorization: Bearer $1" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/packages/container/docker-browser/visibility" \
-              -d '{"visibility":"public"}' \
-              && { echo "GHCR package visibility set to public (PACKAGES_ADMIN_TOKEN)"; exit 0; }
+              "https://api.github.com/$2/visibility" \
+              -d '{"visibility":"public"}'
+          }
+          # Primary GITHUB_TOKEN attempt: repo-scoped, then org-scoped.
+          for scope in "repos/${GITHUB_REPOSITORY}/packages/container/docker-browser" \
+                       "orgs/${ORG}/packages/container/docker-browser"; do
+            code=$(put "${{ secrets.GITHUB_TOKEN }}" "$scope")
+            echo "$scope -> HTTP $code"
+            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+              echo "GHCR package visibility set to public (GITHUB_TOKEN, $scope)"
+              exit 0
+            fi
+          done
+          # Fall back to a classic-PAT secret (write:packages) if provided.
+          if [ -n "$ADMIN_TOKEN" ]; then
+            for scope in "repos/${GITHUB_REPOSITORY}/packages/container/docker-browser" \
+                         "orgs/${ORG}/packages/container/docker-browser"; do
+              code=$(put "$ADMIN_TOKEN" "$scope")
+              echo "$scope (PAT) -> HTTP $code"
+              if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+                echo "GHCR package visibility set to public (PACKAGES_ADMIN_TOKEN, $scope)"
+                exit 0
+              fi
+            done
           else
             echo "PACKAGES_ADMIN_TOKEN not set"
           fi
