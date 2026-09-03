@@ -114,12 +114,22 @@ jobs:
       - name: Make GHCR package public
         # GHCR creates container packages private by default, even in a public
         # repo, so anonymous `docker pull` is denied until the visibility is
-        # flipped. The repo-scoped GITHUB_TOKEN (packages: write) can update it
-        # for its own repository — flip here so a freshly published image is
-        # always pullable without authentication.
+        # flipped. GITHUB_TOKEN cannot do this — the visibility API returns 404
+        # for it (it lacks package admin), so the flip only works with a
+        # PACKAGES_ADMIN_TOKEN secret: a classic PAT with write:packages scope.
+        # Without it the job does not fail — it warns, and the image stays
+        # private until someone flips it once in the repo Packages UI (a linked
+        # package keeps its visibility across later pushes).
+        env:
+          ADMIN_TOKEN: ${{ secrets.PACKAGES_ADMIN_TOKEN }}
         run: |
-          curl -sS --fail-with-body -X PUT \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/packages/container/docker-browser/visibility" \
-            -d '{"visibility":"public"}'
+          if [ -n "$ADMIN_TOKEN" ]; then
+            curl -sS --fail-with-body -X PUT \
+              -H "Authorization: Bearer $ADMIN_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/packages/container/docker-browser/visibility" \
+              -d '{"visibility":"public"}'
+            echo "GHCR package visibility set to public"
+          else
+            echo "::warning::PACKAGES_ADMIN_TOKEN not set — GITHUB_TOKEN cannot flip GHCR package visibility (404). Set a classic-PAT secret (write:packages) for automation, or flip the package to public once in the repo Packages UI."
+          fi
