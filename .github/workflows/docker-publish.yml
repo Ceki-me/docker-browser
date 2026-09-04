@@ -1,21 +1,34 @@
-# Publishes the provider image to Docker Hub when a GitHub Release is published.
+# Publishes the provider image when a GitHub Release is published.
 #
 # This workflow is intentionally NOT triggered on push — it only runs on
-# `release: published`, so a plain push/PR never publishes the image.
+# `release: published` (or manually via workflow_dispatch for a lean
+# republish), so a plain push/PR never publishes the image.
 #
-# Docker Hub secrets required in the repo: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN.
+# Primary target: GitHub Container Registry (GHCR) attached to this repo
+# (ghcr.io/ceki-me/docker-browser). GHCR needs no secrets — the workflow's
+# GITHUB_TOKEN carries packages: write for its own repository.
+#
+# GHCR creates container packages private by default even in a public repo,
+# so after pushing we flip the package visibility to public (the repo-scoped
+# GITHUB_TOKEN may update it) — otherwise anonymous `docker pull` fails.
+#
+# Docker Hub (ceki/provider) push activates automatically once the repo has
+# DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets set; without them the Hub login
+# and hub tags are skipped so the job never fails on a missing Hub account.
 
 name: docker-publish
 
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,17 +54,107 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - id: hubcheck
+        name: Check Docker Hub secrets
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$HUB_USER" ] && [ -n "$HUB_TOKEN" ]; then
+            echo "enabled=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Login to Docker Hub
+        if: steps.hubcheck.outputs.enabled == '1'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          # latest is always pushed; the release tag (and Hub tags) only exist
+          # on a real Release — on workflow_dispatch there is no tag_name.
+          {
+            echo "ghcr.io/ceki-me/docker-browser:latest"
+            if [ "${{ steps.hubcheck.outputs.enabled }}" = "1" ]; then
+              echo "ceki/provider:latest"
+            fi
+          } > /tmp/tags
+          if [ -n "${{ github.event.release.tag_name }}" ]; then
+            {
+              echo "ghcr.io/ceki-me/docker-browser:${{ github.event.release.tag_name }}"
+              if [ "${{ steps.hubcheck.outputs.enabled }}" = "1" ]; then
+                echo "ceki/provider:${{ github.event.release.tag_name }}"
+              fi
+            } >> /tmp/tags
+          fi
+          {
+            echo "tags<<__CEKI_EOF__"
+            cat /tmp/tags
+            echo "__CEKI_EOF__"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            ceki/provider:latest
-            ceki/provider:${{ github.event.release.tag_name }}
+          tags: ${{ steps.tags.outputs.tags }}
+
+      - name: Make GHCR package public
+        # GHCR creates container packages private by default, even in a public
+        # repo, so anonymous `docker pull` is denied until the visibility is
+        # flipped. The pushed image lives either repo-scoped or org-scoped
+        # (Ceki-me is an organization) — probe both and PUT visibility=public
+        # on whichever the GITHUB_TOKEN can address. If none works the job does
+        # not fail — it warns, and the image stays private until someone flips
+        # it once in the Packages UI.
+        env:
+          ADMIN_TOKEN: ${{ secrets.PACKAGES_ADMIN_TOKEN }}
+        run: |
+          set +e
+          ORG="${GITHUB_REPOSITORY_OWNER}"
+          put() {
+            curl -sS -o /tmp/visresp -w '%{http_code}' -X PUT \
+              -H "Authorization: Bearer $1" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/$2/visibility" \
+              -d '{"visibility":"public"}'
+          }
+          # Primary GITHUB_TOKEN attempt: repo-scoped, then org-scoped.
+          for scope in "repos/${GITHUB_REPOSITORY}/packages/container/docker-browser" \
+                       "orgs/${ORG}/packages/container/docker-browser"; do
+            code=$(put "${{ secrets.GITHUB_TOKEN }}" "$scope")
+            echo "$scope -> HTTP $code"
+            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+              echo "GHCR package visibility set to public (GITHUB_TOKEN, $scope)"
+              exit 0
+            fi
+          done
+          # Fall back to a classic-PAT secret (write:packages) if provided.
+          if [ -n "$ADMIN_TOKEN" ]; then
+            for scope in "repos/${GITHUB_REPOSITORY}/packages/container/docker-browser" \
+                         "orgs/${ORG}/packages/container/docker-browser"; do
+              code=$(put "$ADMIN_TOKEN" "$scope")
+              echo "$scope (PAT) -> HTTP $code"
+              if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+                echo "GHCR package visibility set to public (PACKAGES_ADMIN_TOKEN, $scope)"
+                exit 0
+              fi
+            done
+          else
+            echo "PACKAGES_ADMIN_TOKEN not set"
+          fi
+          echo "::warning::could not flip GHCR package visibility — set PACKAGES_ADMIN_TOKEN (classic PAT, write:packages) or flip it once in the Packages UI"
+          exit 0

@@ -151,9 +151,7 @@ patch_extension_urls
 # --- Viewport / Xvfb screen ---------------------------------------------------
 # CEKI_PROVIDER_VIEWPORT (WxH, default 1920x1080) drives both the Chromium
 # window size / viewport (app.py) and the Xvfb framebuffer, so the virtual
-# screen always matches the rendered resolution. The screen height gets a
-# +120px margin so full-page screenshots that run past the bottom of the
-# viewport are not clipped by the virtual display. Unparseable values fall
+# screen always matches the rendered resolution. Unparseable values fall
 # back to the default.
 CEKI_PROVIDER_VIEWPORT="${CEKI_PROVIDER_VIEWPORT:-1920x1080}"
 case "$CEKI_PROVIDER_VIEWPORT" in
@@ -167,12 +165,17 @@ if ! echo "$XVFB_W" | grep -qE '^[0-9]+$' || ! echo "$XVFB_H_RAW" | grep -qE '^[
   XVFB_W=1920
   XVFB_H_RAW=1080
 fi
-XVFB_H="$(( XVFB_H_RAW + 120 ))"
+XVFB_H="$XVFB_H_RAW"
 export CEKI_PROVIDER_VIEWPORT="${XVFB_W}x${XVFB_H_RAW}"
 
 # Start Xvfb if it is not already up on our display.
+# Clear stale lock/socket first: on `docker restart` the writable layer keeps
+# /tmp/.X99-lock from the previous (killed) Xvfb, the new one refuses to start
+# ("If this server is no longer running, remove /tmp/.X99-lock"), and chromium
+# then dies with "Missing X server" -> crash-loop.
 if ! xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
   echo "[ceki-provider] starting Xvfb on ${DISPLAY} (screen ${XVFB_W}x${XVFB_H}x24)"
+  rm -f "/tmp/.X${DISPLAY#:}-lock" "/tmp/.X11-unix/X${DISPLAY#:}"
   Xvfb "${DISPLAY}" -screen 0 "${XVFB_W}x${XVFB_H}x24" -nolisten tcp >/tmp/xvfb.log 2>&1 &
 fi
 

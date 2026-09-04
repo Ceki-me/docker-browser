@@ -42,6 +42,7 @@ from typing import Any
 import httpx
 
 from ceki_sdk._config import default_api_url
+from ceki_browser_provider import provider_debug
 
 log = logging.getLogger("ceki.provider")
 
@@ -333,6 +334,8 @@ class ProviderContext:
     token: str
     schedule_id: int | None
     api_base: str
+    debug_capture: Any = None
+    debug_stop: threading.Event | None = None
 
 
 def _ensure_timezone() -> None:
@@ -550,6 +553,7 @@ def _launch_provider(
     _ensure_timezone()
 
     chromium = playwright.chromium
+    debug = provider_debug.config_from_env()
     profile_dir = tempfile.mkdtemp(prefix="ceki-provider-")
     default_dir = Path(profile_dir) / "Default"
     default_dir.mkdir(parents=True, exist_ok=True)
@@ -655,6 +659,12 @@ def _launch_provider(
     except Exception as exc:
         log.warning("two-launch: Preferences edit failed: %s", exc)
 
+    # Debug capture: open the CDP port only on the final (run) launch — the
+    # install phase above already closed its Chromium, so the port never races.
+    if debug:
+        chrome_args.extend(debug.chrome_args())
+        log.info("debug capture: chrome args extended with %s", debug.chrome_args())
+
     browser_context = launch(load_ext)
     discovered = _discover_ext_id(browser_context, expected=expected_id, wait_s=60.0)
     if discovered:
@@ -717,6 +727,13 @@ def _launch_provider(
         shutil.rmtree(profile_dir, ignore_errors=True)
         raise ProviderError(f"Extension did not come online: {status}")
 
+    dbg_mgr = None
+    dbg_stop = None
+    if debug is not None:
+        dbg_stop = threading.Event()
+        dbg_mgr = provider_debug.start_capture(debug, ext_id, dbg_stop)
+        log.info("debug capture manager started" if dbg_mgr else "debug capture manager failed to start")
+
     return ProviderContext(
         browser_context=browser_context,
         profile_dir=profile_dir,
@@ -724,6 +741,8 @@ def _launch_provider(
         token=token,
         schedule_id=schedule_id,
         api_base=api_base,
+        debug_capture=dbg_mgr,
+        debug_stop=dbg_stop,
     )
 
 
@@ -803,6 +822,8 @@ def run_provider(
                 ctx.browser_context.close()
             except Exception:
                 pass
+            if ctx.debug_capture is not None:
+                provider_debug.stop_capture(ctx.debug_capture)
             shutil.rmtree(ctx.profile_dir, ignore_errors=True)
     return 0
 
