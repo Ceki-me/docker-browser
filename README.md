@@ -32,9 +32,9 @@ stop the container.
 ### With docker compose
 
 > The image bundles the browser-extension dist, which must be staged **before**
-> building. Run `./build.sh` first (it copies the extension dist into the
-> git-ignored `extension/` directory). If you skip this, `docker compose
-> up --build` fails at the `COPY extension/` step.
+> building. Run `./build.sh` first (it downloads the latest extension release
+> into the git-ignored `extension/` directory). If you skip this, `docker
+> compose up --build` fails at the `COPY extension/` step.
 
 ```bash
 export CEKI_PROVIDER_TOKEN=<your-token>
@@ -49,31 +49,28 @@ docker compose stop provider
 | Env var | Default | Description |
 |---|---|---|
 | `CEKI_PROVIDER_TOKEN` | — | **Required.** One-time browser token from your dashboard. |
-| `CEKI_WS_URL` | `wss://browser.ceki.me/ws/provider` | Relay WebSocket URL. Overrides the PROD URL baked into the extension bundle at runtime (see below). |
-| `CEKI_API_URL` | `https://api.ceki.me` | API base URL — used by the launcher (token handshake) and substituted into the extension bundle at runtime. |
 | `CEKI_PROVIDER_VIEWPORT` | `1920x1080` | Browser viewport / resolution (WxH). Full HD by default; drives both the Chromium viewport and the Xvfb screen (+120px height margin for full-page screenshots). |
+| `CEKI_PROVIDER_EXT_DIR` | `/opt/ceki/extension` | Path to the unpacked extension dist (used by the bundled `--load-extension` fallback). Only needed when staging the extension somewhere else. |
+| `CEKI_PROVIDER_LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` (also set by `--verbose`). |
 | `DISPLAY` | `:99` | X display for the virtual screen. |
 | `TZ` | host timezone | Browser timezone (keeps it consistent with your location). |
 
-### One image, environment at runtime
-
-The image ships with the **PROD** environment baked in and defaults to prod.
-The extension is static JS and cannot read container env, so the entrypoint
-replaces the PROD URL strings in the bundled extension config before Chromium
-starts when the env is set (and differs from the default). No separate dev
-image is needed (`ceki/provider:dev` is deprecated).
+The image ships with the **PROD** environment baked in and defaults to prod —
+no environment configuration is needed beyond the token.
 
 ```bash
-# prod (default) — no env needed beyond the token
 docker run --rm -e CEKI_PROVIDER_TOKEN=<your-token> ceki/provider
-
-# dev stand — override the relay + API URLs
-docker run --rm \
-  -e CEKI_PROVIDER_TOKEN=<your-token> \
-  -e CEKI_WS_URL=wss://browser.ittribe.org/ws/provider \
-  -e CEKI_API_URL=https://clawapi.ittribe.org \
-  ceki/provider
 ```
+
+### Extension auto-update (external policy)
+
+By default the container asks **Chrome itself** to install and keep the Ceki
+extension updated. The entrypoint writes an external-extension policy file
+(`/usr/share/chromium/extensions/<id>.json`) that points at the prod update
+channel (`https://browser.ceki.me/ext/updates.xml`). On first launch Chrome
+installs the extension from the channel, and afterwards **re-checks the channel
+every few hours and updates the running extension automatically** — no rebuild,
+no container restart, even for a provider that has been online for months.
 
 ## Stopping / cleanup
 
@@ -82,13 +79,30 @@ your browser goes **offline**. `docker compose stop` does the same.
 
 ## Building from source
 
-The image bundles the browser-extension dist, so the build script stages it
-from a local copy of the extension before running `docker build`:
+The image bundles the browser-extension dist. The build script stages it into
+the git-ignored `extension/` directory before running `docker build`:
 
 ```bash
-./build.sh                              # finds browser-extension/dist automatically
-./build.sh /path/to/browser-extension/dist
+./build.sh                       # default: download the latest extension release
 ```
+
+By default `build.sh` downloads the latest published extension release bundle
+(`ceki-browser-extension-latest.zip`) from the extension host, so a build works
+on a fresh clone with no local extension checkout. You can point it at any other
+source instead:
+
+```bash
+./build.sh --url https://host.example.com/ext/ceki-browser-extension-latest.zip   # download zip
+./build.sh --url https://host.example.com/ext/ceki-browser-extension-latest.crx   # download crx
+./build.sh --zip ./ceki-browser-extension-latest.zip                              # local zip
+./build.sh --crx ./ceki-browser-extension-latest.crx                             # local crx
+./build.sh --dir /path/to/unpacked/dist                                          # local build
+./build.sh /path/to/unpacked/dist                                                 # same as --dir
+```
+
+Environment equivalents: `CEKI_EXT_URL`, `CEKI_EXT_ZIP`, `CEKI_EXT_CRX`,
+`CEKI_EXT_DIST`. Without any source the script falls back to a local clone of
+`browser-extension` if one is found next to this repo.
 
 This produces the `ceki/provider:latest` image locally. The published image on
 Docker Hub is built automatically from tagged releases.

@@ -37,8 +37,9 @@ jobs:
       # the prod host (https://browser.ceki.me/ext/...) — the same bundle the
       # extension updater serves and the default source ./build.sh uses, so a
       # CI-built image equals a local-built image. This avoids depending on a
-      # browser-extension release asset whose tag would have to match this
-      # repo's release tag (release tags differ between the two repos).
+      # browser-extension release whose asset name/tag must match this repo's
+      # release tag (the old URL could never resolve: no `extension.zip` asset
+      # exists there, and release tags differ between the two repos).
       - name: Stage extension dist
         run: |
           set -euo pipefail
