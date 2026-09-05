@@ -666,6 +666,11 @@ def _launch_provider(
         log.info("debug capture: chrome args extended with %s", debug.chrome_args())
 
     browser_context = launch(load_ext)
+
+    # Handle JavaScript dialogs (alert/confirm/prompt) to prevent unhandled
+    # ProtocolError in Playwright's internal Node.js driver (crashes browser context).
+    browser_context.on("dialog", lambda dialog: dialog.dismiss())
+
     discovered = _discover_ext_id(browser_context, expected=expected_id, wait_s=60.0)
     if discovered:
         ext_id = discovered
