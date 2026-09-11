@@ -28,7 +28,16 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE="${CEKI_IMAGE:-ceki/provider:latest}"
+# Browser flavor: chromium (default) | yandex | pseudo-yandex. Yandex also
+# tags the image ceki/provider:yandex unless CEKI_IMAGE overrides it.
+FLAVOR="${CEKI_BROWSER_FLAVOR:-chromium}"
+case "$FLAVOR" in
+  chromium)      DEFAULT_TAG="ceki/provider:latest" ;;
+  yandex)        DEFAULT_TAG="ceki/provider:yandex" ;;
+  pseudo-yandex) DEFAULT_TAG="ceki/provider:pseudo-yandex" ;;
+  *) echo "error: CEKI_BROWSER_FLAVOR must be 'chromium', 'yandex' or 'pseudo-yandex', got: $FLAVOR" >&2; exit 1 ;;
+esac
+IMAGE="${CEKI_IMAGE:-$DEFAULT_TAG}"
 
 # ---------------------------------------------------------------------------
 # Resolve the extension source.
@@ -131,8 +140,12 @@ stage_ext() { # $1 = src, $2 = kind
 unpack_zip() {
   local z="$1"
   # Unzip preserving the bundle root; strips a single top-level dir if present.
+  # Single-quoted trap body: expanded at trap RUNTIME (script exit), so the
+  # variable must still exist by then — hence global, not local (set -u would
+  # abort on an unbound function-local at script exit).
   local tmpd; tmpd="$(mktemp -d)"
-  trap 'rm -rf "$tmpd"' EXIT
+  cleanup="$tmpd"
+  trap 'rm -rf "$cleanup"' EXIT
   unzip -q "$z" -d "$tmpd"
   if [ -f "$tmpd/manifest.json" ]; then
     cp -a "$tmpd"/. "$ROOT/extension/"
@@ -189,8 +202,8 @@ fi
 
 stage_ext "$EXT_SRC" "$EXT_KIND"
 
-echo "[ceki-provider] building image: $IMAGE"
-docker build -t "$IMAGE" -f "$ROOT/Dockerfile" "$ROOT"
+echo "[ceki-provider] building image: $IMAGE (flavor: $FLAVOR)"
+docker build --build-arg FLAVOR="$FLAVOR" -t "$IMAGE" -f "$ROOT/Dockerfile" "$ROOT"
 
 echo "[ceki-provider] done: $IMAGE"
 echo "  run:  docker run --rm -e CEKI_PROVIDER_TOKEN=<token> $IMAGE"

@@ -56,7 +56,7 @@ write_external_policy() {
   # + URL patching below. CEKI_API_URL alone does NOT disable the policy — the
   # provider handshake can target any API while the extension build comes from
   # the channel.
-  if [ -n "${CEKI_EXT_SKIP_UPDATE:-}" ]; then
+  if [ -n "${CEKI_EXT_SKIP_UPDATE:-}" ] && [ "${CEKI_PROVIDER_BROWSER:-}" != "yandex" ]; then
     echo "[ceki-provider] extension: external policy disabled (CEKI_EXT_SKIP_UPDATE=1)"
     return 0
   fi
@@ -64,10 +64,34 @@ write_external_policy() {
     echo "[ceki-provider] extension: CEKI_WS_URL override — unpacked patching mode, no external policy"
     return 0
   fi
-  policy_dir="/usr/share/chromium/extensions"
-  mkdir -p "$policy_dir"
-  printf '{"external_update_url":"%s"}\n' "$EXT_POLICY_URL" > "$policy_dir/$EXT_ID.json"
-  echo "[ceki-provider] extension: external policy -> $policy_dir/$EXT_ID.json ($EXT_POLICY_URL)"
+  # Chromium (unbranded): external_update_url file in /usr/share/chromium/extensions.
+  # Yandex Browser: only its corporate build honors policies, and only the
+  # ExtensionInstallForcelist form — the external_update_url file is gated
+  # behind Yandex's experiment system even there (verified live). The policy
+  # root is /etc/opt/yandex/browser/policies/managed/ceki.json.
+  #
+  # YandexProtectedMode:false is required, not cosmetic. Protected mode turns
+  # itself on for online-banking/payment pages and disables every extension
+  # except Yandex-approved password managers — so on those sites the provider's
+  # own extension stops running, chrome.debugger.attach fails with
+  # "Access denied." and the rental dies about a second after it starts.
+  # Reproduced live on online.sberbank.ru, online.vtb.ru, www.tinkoff.ru
+  # (online.alfabank.ru, gosuslugi.ru and plain sberbank.ru were unaffected);
+  # with the policy off all of them attach normally. Written into the same
+  # policy file as the forcelist so a container recreate cannot drop it.
+  if [ "${CEKI_PROVIDER_BROWSER:-}" = "yandex" ]; then
+    mkdir -p /etc/opt/yandex/browser/policies/managed
+    printf '{"ExtensionInstallForcelist":["%s;%s"],"YandexProtectedMode":false}\n' "$EXT_ID" "$EXT_POLICY_URL" \
+      > /etc/opt/yandex/browser/policies/managed/ceki.json
+    echo "[ceki-provider] extension: forcelist + YandexProtectedMode=false -> /etc/opt/yandex/browser/policies/managed/ceki.json ($EXT_POLICY_URL)"
+    return 0
+  fi
+  policy_dirs="/usr/share/chromium/extensions"
+  for policy_dir in $policy_dirs; do
+    mkdir -p "$policy_dir"
+    printf '{"external_update_url":"%s"}\n' "$EXT_POLICY_URL" > "$policy_dir/$EXT_ID.json"
+    echo "[ceki-provider] extension: external policy -> $policy_dir/$EXT_ID.json ($EXT_POLICY_URL)"
+  done
 }
 
 # --- Extension auto-update from the release channel ---------------------------
