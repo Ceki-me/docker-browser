@@ -43,8 +43,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Russian Trusted Root CA / Sub CA (Минцифры, НУЦ) — see Dockerfile for the
-# full rationale.
-COPY certs/russian_trusted_root_ca.crt certs/russian_trusted_sub_ca.crt /usr/local/share/ca-certificates/
+# full rationale and the pinning scheme. Fetched at build time from gu-st.ru,
+# pinned by sha256 (DER).
+ARG RU_ROOT_CA_SHA256=d26d2d0231b7c39f92cc738512ba54103519e4405d68b5bd703e9788ca8ecf31
+ARG RU_SUB_CA_SHA256=bbbde2103e790b999ec62bd03cf625a5a2e7c316e10afe6a490eedead8b3fd9b
+RUN set -eu; \
+    fetch_pin() { \
+        url="$1"; pin="$2"; out="$3"; \
+        curl -fsSL --retry 3 --connect-timeout 15 "$url" -o "$out"; \
+        got="$(openssl x509 -in "$out" -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)"; \
+        if [ "$got" != "$pin" ]; then \
+            echo "FATAL: $url sha256 mismatch: expected $pin, got $got" >&2; \
+            exit 1; \
+        fi; \
+    }; \
+    fetch_pin "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt" \
+        "$RU_ROOT_CA_SHA256" /usr/local/share/ca-certificates/russian_trusted_root_ca.crt; \
+    fetch_pin "https://gu-st.ru/content/lending/russian_trusted_sub_ca_pem.crt" \
+        "$RU_SUB_CA_SHA256" /usr/local/share/ca-certificates/russian_trusted_sub_ca.crt
 RUN update-ca-certificates \
     && for db in /etc/pki/nssdb /root/.pki/nssdb; do \
         mkdir -p "$db" \
