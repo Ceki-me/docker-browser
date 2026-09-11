@@ -1,0 +1,85 @@
+# syntax=docker/dockerfile:1
+#
+# Ceki headless-browser provider image — PSEUDO-YANDEX flavor.
+#
+# Same image as Dockerfile (chromium): Playwright's Chromium, but the provider
+# patches the browser identity to look like Yandex Browser — the YaBrowser UA
+# string plus Client Hints (brands, fullVersionList, platform), applied per
+# page via CDP Network.setUserAgentOverride in app.py when
+# CEKI_PROVIDER_BROWSER=pseudo-yandex.
+#
+# NOT a real Yandex build — no Yandex internals, config channels or ytrust.
+# Fine where only the UA matters (Yandex services that check the string);
+# anything probing deeper (Yandex's own fingerprinting, ytrust TLS) will see
+# through it. For the real thing use Dockerfile.yandex.
+#
+# Build context = repo root. `build.sh` stages the extension dist into
+# extension/ (git-ignored) before `docker build`.
+#
+# Sibling images: Dockerfile (chromium, default), Dockerfile.yandex (real
+# Yandex Browser).
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    DISPLAY=:99 \
+    PYTHONPATH=/opt/ceki/src
+
+WORKDIR /opt/ceki
+
+LABEL org.opencontainers.image.source=https://github.com/Ceki-me/docker-browser \
+      org.opencontainers.image.title=ceki-browser-provider-pseudo-yandex \
+      org.opencontainers.image.description="Ceki headless-browser provider image: Chromium with a YaBrowser UA + browser extension + provider launcher"
+
+# Chromium runtime libraries + Xvfb virtual display + libnss3-tools (certutil
+# for the NSS trust DB — see the CA block).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libnss3 libnspr4 libnss3-tools libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+        libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 \
+        libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 libxshmfence1 \
+        libglib2.0-0 libgdk-pixbuf-2.0-0 xvfb xauth x11-utils ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Russian Trusted Root CA / Sub CA (Минцифры, НУЦ) — see Dockerfile for the
+# full rationale.
+COPY certs/russian_trusted_root_ca.crt certs/russian_trusted_sub_ca.crt /usr/local/share/ca-certificates/
+RUN update-ca-certificates \
+    && for db in /etc/pki/nssdb /root/.pki/nssdb; do \
+        mkdir -p "$db" \
+        && certutil -N -d "sql:$db" --empty-password \
+        && certutil -A -d "sql:$db" -t "C,," -n "Russian Trusted Root CA" \
+            -i /usr/local/share/ca-certificates/russian_trusted_root_ca.crt \
+        && certutil -A -d "sql:$db" -t "C,," -n "Russian Trusted Sub CA" \
+            -i /usr/local/share/ca-certificates/russian_trusted_sub_ca.crt; \
+    done
+
+# Python deps: the SDK (API client + config) and Playwright (Chromium driver).
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Provider launcher module (this repo).
+COPY src/ /opt/ceki/src/
+
+# Chromium pinned by Playwright — the provider browser on this image.
+RUN python -m playwright install chromium
+
+# This image rents out Chromium with the YaBrowser UA patch (app.py applies
+# the UA + Client Hints per page when the flavor is pseudo-yandex).
+ENV CEKI_PROVIDER_BROWSER=pseudo-yandex
+
+# Bundled browser extension dist (staged into extension/ by build.sh).
+COPY extension/ /opt/ceki/extension/
+
+# CEKI_PROVIDER_TOKEN is supplied at runtime (docker run -e ...).
+ENV CEKI_PROVIDER_EXT_DIR=/opt/ceki/extension \
+    CEKI_PROVIDER_LOG_LEVEL=INFO
+
+# Entrypoint starts Xvfb (if needed) and then execs the command as PID 1 so a
+# `docker stop` (SIGTERM to PID 1) reaches the provider for a clean shutdown.
+COPY entrypoint.sh /usr/local/bin/ceki-entrypoint
+RUN chmod +x /usr/local/bin/ceki-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/ceki-entrypoint"]
+CMD ["python", "-m", "ceki_browser_provider.app"]

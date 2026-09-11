@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# Ceki headless-browser provider image.
+# Ceki headless-browser provider image — CHROMIUM flavor (default).
 #
 # Runs the provider launcher (src/ceki_browser_provider):
 #   * Chromium (Playwright) — the rented public browser
@@ -13,26 +13,10 @@
 # Build context = repo root. `build.sh` stages the extension dist into
 # extension/ (git-ignored) before `docker build`.
 #
-# Browser flavor (build arg FLAVOR, consumed by build.sh):
-#   chromium (default) — Playwright's pinned Chromium, as before
-#   yandex             — also installs Yandex Browser (repo.yandex.ru deb) and
-#                        defaults CEKI_PROVIDER_BROWSER=yandex at runtime, so
-#                        the provider rents out a real YaBrowser build (its UA
-#                        carries YaBrowser/<ver>, trusted harder by Yandex
-#                        services). Playwright Chromium stays installed as a
-#                        fallback binary.
-#   pseudo-yandex      — the Playwright Chromium with a YaBrowser UA (string +
-#                        Client Hints, applied by app.py at launch). NOT a real
-#                        Yandex build — no Yandex internals, config channels or
-#                        ytrust — but cheaper than the yandex image and fine
-#                        where only the UA matters. Same image as chromium plus
-#                        the flavor env (no extra packages needed).
-# All flavors include the Russian Trusted CA (Минцифры) in the system and NSS
-# trust stores — sanctioned RU sites (sberbank etc.) resolve their TLS on it.
+# Sibling images: Dockerfile.yandex (real Yandex Browser),
+# Dockerfile.pseudo-yandex (Chromium with a YaBrowser UA).
 
-FROM python:3.11-slim AS runtime
-
-ARG FLAVOR=chromium
+FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -63,22 +47,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # RU banks/sites (sberbank.ru, tbank, gov services) switched to after Western
 # CAs stopped serving them. Not in the Mozilla/Chrome root programs, so plain
 # Chromium fails those sites with ERR_CERT_AUTHORITY_INVALID (Yandex Browser
-# ships this root in its own build, which is why the yandex flavor opens them
+# ships this root in its own build, which is why the yandex image opens them
 # without any of this). Install into both trust paths:
 #   - system CA bundle (update-ca-certificates) → curl/python/requests inside
 #     the container, and Chromium when no NSS user DB exists
 #   - the machine-wide NSS DB (/etc/pki/nssdb) → Chromium's "locally managed
 #     roots" policy (Chrome on Linux reads NSS DBs in addition to its own
 #     root store; local roots skip the CT/public-audit requirements)
+# Chromium probes the *user's* ~/.pki/nssdb first and falls back to the
+# machine-wide /etc/pki/nssdb — the container runs as root, so /root/.pki/nssdb
+# is seeded too (both DBs, so a different USER works as well).
 # Source: gu-st.ru (Mintsifry's own hosting). COPY from certs/ (in-repo) so
 # builds are reproducible and don't depend on gu-st.ru uptime.
-# Both trust paths get the roots:
-#   - system CA bundle (update-ca-certificates) → curl/python inside the container
-#   - NSS DBs → Chromium's "locally managed roots" (Chrome on Linux reads NSS
-#     DBs in addition to its own root store; local roots skip CT/public-audit
-#     requirements). Chromium probes the *user's* ~/.pki/nssdb first and falls
-#     back to the machine-wide /etc/pki/nssdb — the container runs as root, so
-#     /root/.pki/nssdb is seeded too (both DBs, so a different USER works as well).
 COPY certs/russian_trusted_root_ca.crt certs/russian_trusted_sub_ca.crt /usr/local/share/ca-certificates/
 RUN update-ca-certificates \
     && for db in /etc/pki/nssdb /root/.pki/nssdb; do \
@@ -97,36 +77,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Provider launcher module (this repo).
 COPY src/ /opt/ceki/src/
 
-# Chromium pinned by Playwright (used only by the provider browser).
+# Chromium pinned by Playwright — the provider browser on this image.
 RUN python -m playwright install chromium
 
-# Yandex flavor: the CORPORATE deb from the official repo, plus its deps.
-# Pinned implicitly by the pool snapshot at build time; entrypoint writes the
-# ExtensionInstallForcelist policy into /etc/opt/yandex/browser/policies/managed
-# when CEKI_PROVIDER_BROWSER=yandex. The deb ships /usr/bin/yandex-browser.
-#
-# Why corporate and not stable: only the corporate build honors extension
-# policies. stable/beta strip the --load-extension switch outright and gate
-# every other install path behind their own experiment system (the deb's own
-# Extensions/*.json carries "experiment":"cdt2"; without it the file is
-# skipped, and the same goes for external_update_url files and
-# ExtensionSettings). The corporate build reads the managed-policy root
-# normally — verified live: ExtensionInstallForcelist installs the extension
-# from the update channel and its MV3 service worker starts.
-RUN if [ "$FLAVOR" = "yandex" ]; then \
-        apt-get update && apt-get install -y --no-install-recommends wget gnupg \
-        && wget -qO- https://repo.yandex.ru/yandex-browser/YANDEX-BROWSER-KEY.GPG \
-            | gpg --dearmor -o /usr/share/keyrings/yandex-browser.gpg \
-        && echo "deb [signed-by=/usr/share/keyrings/yandex-browser.gpg] https://repo.yandex.ru/yandex-browser/deb stable main" \
-            > /etc/apt/sources.list.d/yandex-browser.list \
-        && apt-get update && apt-get install -y --no-install-recommends yandex-browser-corporate \
-        && rm -rf /var/lib/apt/lists/*; \
-    fi
-
-# Default the provider browser to the image flavor (both are settable at
-# runtime; CEKI_PROVIDER_BROWSER=yandex on the chromium image falls back to
-# Chromium with a warning since the Yandex binary is absent).
-ENV CEKI_PROVIDER_BROWSER=${FLAVOR}
+# This image rents out Playwright's Chromium (app.py reads the env to pick the
+# binary; settable at runtime, e.g. CEKI_PROVIDER_BROWSER=pseudo-yandex is
+# meaningless here — the YaBrowser UA patch lives on the pseudo-yandex image).
+ENV CEKI_PROVIDER_BROWSER=chromium
 
 # Bundled browser extension dist (staged into extension/ by build.sh).
 COPY extension/ /opt/ceki/extension/

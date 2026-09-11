@@ -28,13 +28,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Browser flavor: chromium (default) | yandex | pseudo-yandex. Yandex also
-# tags the image ceki/provider:yandex unless CEKI_IMAGE overrides it.
+# Browser flavor: chromium (default) | yandex | pseudo-yandex. Each flavor is
+# its own Dockerfile (Dockerfile, Dockerfile.yandex, Dockerfile.pseudo-yandex)
+# and its own image tag, unless CEKI_IMAGE overrides it.
 FLAVOR="${CEKI_BROWSER_FLAVOR:-chromium}"
 case "$FLAVOR" in
-  chromium)      DEFAULT_TAG="ceki/provider:latest" ;;
-  yandex)        DEFAULT_TAG="ceki/provider:yandex" ;;
-  pseudo-yandex) DEFAULT_TAG="ceki/provider:pseudo-yandex" ;;
+  chromium)      DOCKERFILE="Dockerfile";              DEFAULT_TAG="ceki/provider:latest" ;;
+  yandex)        DOCKERFILE="Dockerfile.yandex";       DEFAULT_TAG="ceki/provider:yandex" ;;
+  pseudo-yandex) DOCKERFILE="Dockerfile.pseudo-yandex"; DEFAULT_TAG="ceki/provider:pseudo-yandex" ;;
   *) echo "error: CEKI_BROWSER_FLAVOR must be 'chromium', 'yandex' or 'pseudo-yandex', got: $FLAVOR" >&2; exit 1 ;;
 esac
 IMAGE="${CEKI_IMAGE:-$DEFAULT_TAG}"
@@ -202,8 +203,8 @@ fi
 
 stage_ext "$EXT_SRC" "$EXT_KIND"
 
-echo "[ceki-provider] building image: $IMAGE (flavor: $FLAVOR)"
-docker build --build-arg FLAVOR="$FLAVOR" -t "$IMAGE" -f "$ROOT/Dockerfile" "$ROOT"
+echo "[ceki-provider] building image: $IMAGE (flavor: $FLAVOR, dockerfile: $DOCKERFILE)"
+docker build -t "$IMAGE" -f "$ROOT/$DOCKERFILE" "$ROOT"
 
 echo "[ceki-provider] done: $IMAGE"
 echo "  run:  docker run --rm -e CEKI_PROVIDER_TOKEN=<token> $IMAGE"
