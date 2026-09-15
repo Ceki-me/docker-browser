@@ -654,6 +654,50 @@ class SpawnManager:
             log.info("handshake: storage set -> %s", json.dumps(result)[:200])
         except Exception as exc:
             log.warning("handshake failed: %s", exc)
+        self._retry_token_after_offscreen(inst, sw_ws, payload)
+
+    def _retry_token_after_offscreen(
+        self, inst: Instance, sw_ws: str, payload: dict
+    ) -> None:
+        """Re-deliver the token once the offscreen document is up.
+
+        The first ``storage.local.set`` fires ``storage.onChanged`` immediately,
+        while the SW's ``offscreenPort`` may still be null (offscreen document
+        not created yet). ``sendToOffscreen(token_updated)`` is then a no-op and
+        the message is lost; when offscreen later connects, ``offscreen_hello``
+        sees ``sanctum_token === _lastKnownToken`` and skips ``token_updated`` —
+        so the offscreen never opens its presence-WS (QA repro, ev 8639).
+
+        Fix on the daemon side (no extension change): wait for the offscreen
+        page target, then clear the token and re-set it. The second
+        ``onChanged`` fires with the live port: ``token_cleared`` then
+        ``token_updated`` reach the offscreen, which connects to the local WS.
+        """
+        off_ws = None
+        for _ in range(60):  # up to ~30s for offscreen to appear
+            off_ws = self._find_offscreen_target(inst)
+            if off_ws is not None:
+                break
+            time.sleep(0.5)
+        if off_ws is None:
+            log.warning("handshake: offscreen target never appeared, token may be lost")
+            return
+        # Clear then re-set: onChanged fires token_cleared then token_updated,
+        # now delivering into the live offscreenPort.
+        try:
+            self._cdp_eval(sw_ws, "chrome.storage.local.remove('sanctum_token', () => true)")
+            log.info("handshake: token cleared for re-delivery")
+        except Exception as exc:
+            log.warning("handshake: token clear failed: %s", exc)
+        time.sleep(0.7)  # let the onChanged debounce (50ms + tick) process
+        try:
+            self._cdp_eval(
+                sw_ws,
+                "chrome.storage.local.set(" + json.dumps(payload) + ", () => true)",
+            )
+            log.info("handshake: token re-set after offscreen ready")
+        except Exception as exc:
+            log.warning("handshake: token re-set failed: %s", exc)
 
     def _find_target_ws(self, inst: Instance, kind: str, ext_id: str) -> str | None:
         """Return the webSocketDebuggerUrl of the first target of ``kind`` whose
@@ -668,6 +712,21 @@ class SpawnManager:
                 continue
             url = t.get("url") or ""
             if f"chrome-extension://{ext_id}/" in url:
+                return t.get("webSocketDebuggerUrl")
+        return None
+
+    def _find_offscreen_target(self, inst: Instance) -> str | None:
+        """Return the CDP ws URL of the extension's offscreen document, if the
+        SW has created it. The offscreen doc is a `page` target whose URL is
+        ``chrome-extension://<ext_id>/offscreen/offscreen.html``."""
+        cdp = f"http://127.0.0.1:{inst.cdp_port}"
+        try:
+            targets = httpx.get(f"{cdp}/json/list", timeout=2).json()
+        except Exception:
+            return None
+        for t in targets:
+            url = t.get("url") or ""
+            if f"/offscreen/offscreen.html" in url:
                 return t.get("webSocketDebuggerUrl")
         return None
 
