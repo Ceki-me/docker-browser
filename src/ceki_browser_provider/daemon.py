@@ -106,6 +106,9 @@ class DaemonConfig:
     persist_session_dir: str = "/sessions-persist"
     max_sessions: int = 1
     browser_binary: str | None = None
+    policy_installed_ext: bool = False  # True for branded builds (yandex): the
+    # extension loads via ExtensionInstallForcelist policy (CRX), NOT
+    # --load-extension, which the corporate build strips.
     cdps: list[int] = field(default_factory=list)
     displays: list[int] = field(default_factory=list)
     local_ws_url: str = ""
@@ -175,6 +178,11 @@ def load_config() -> DaemonConfig:
         persist_session_dir=os.environ.get("CEKI_SESSION_PERSIST_DIR", "/sessions-persist"),
         max_sessions=max(1, max_sessions),
         browser_binary=provider_app._browser_binary(),
+        # Branded builds (yandex) install the extension via
+        # ExtensionInstallForcelist (CRX from the update channel); their
+        # corporate build strips --load-extension, so the daemon must not rely
+        # on an unpacked copy there.
+        policy_installed_ext=(os.environ.get("CEKI_PROVIDER_BROWSER") == "yandex"),
         cdps=list(range(cdp_start, cdp_start + max_sessions)),
         displays=list(range(display_start, display_start + max_sessions)),
     )
@@ -477,8 +485,14 @@ class SpawnManager:
         args.append(f"--disk-cache-dir={inst.profile_dir}/cache")
         args.append(f"--remote-debugging-port={inst.cdp_port}")
         args.append("--remote-allow-origins=*")
-        args.append(f"--load-extension={ext_dir}")
-        args.append(f"--disable-extensions-except={ext_dir}")
+        if not self.cfg.policy_installed_ext:
+            # Unpacked-extension flags. Skipped on branded builds (yandex):
+            # the corporate build strips --load-extension, so the extension is
+            # installed from the update channel via ExtensionInstallForcelist
+            # instead and the socket-path patch is delivered by the managed
+            # policy (write_managed_policy in entrypoint).
+            args.append(f"--load-extension={ext_dir}")
+            args.append(f"--disable-extensions-except={ext_dir}")
         return args
 
     def _launch_chrome(self, inst: Instance, args: list[str]) -> subprocess.Popen:
@@ -540,7 +554,7 @@ class SpawnManager:
         the Chrome binary directly via subprocess and attaching over CDP for
         the handshake (no Playwright persistent-context ownership).
         """
-        ext_dir = self._patched_ext_dir()
+        ext_dir = "" if self.cfg.policy_installed_ext else self._patched_ext_dir()
         profile = inst.profile_dir
         Path(profile).mkdir(parents=True, exist_ok=True)
         Path(profile, "Default").mkdir(parents=True, exist_ok=True)
