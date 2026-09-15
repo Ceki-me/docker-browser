@@ -204,9 +204,15 @@ def _pid_alive(pid: int) -> bool:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except (ProcessLookupError, PermissionError):
         return False
+    # kill(pid, 0) returns successfully for zombies — treat them as dead so a
+    # re-spawn can reclaim the CDP/display slot without waiting for a reap.
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text().split()
+        return stat[2] != "Z"
+    except Exception:
+        return True
 
 
 def _cmdlines() -> list[str]:
@@ -325,6 +331,12 @@ class SpawnManager:
         if inst is None:
             return
         self._kill_group(inst)
+        # Return CDP/display slots to the pool so a later ensure() can reuse
+        # them (sequential rent cycle: session_end -> next match spawns again).
+        if inst.cdp_port not in self.cfg.cdps and len(self.cfg.cdps) < self.cfg.max_sessions:
+            self.cfg.cdps.append(inst.cdp_port)
+        if inst.display not in self.cfg.displays and len(self.cfg.displays) < self.cfg.max_sessions:
+            self.cfg.displays.append(inst.display)
         if not self.cfg.persist:
             shutil.rmtree(inst.profile_dir, ignore_errors=True)
             log.info("session %s destroyed (%s), profile removed", session_id, reason)
