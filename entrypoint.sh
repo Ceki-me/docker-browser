@@ -61,8 +61,16 @@ write_external_policy() {
     return 0
   fi
   if [ -n "${CEKI_WS_URL:-}" ] && [ "$CEKI_WS_URL" != "$DEFAULT_WS_URL" ]; then
-    echo "[ceki-provider] extension: CEKI_WS_URL override — unpacked patching mode, no external policy"
-    return 0
+    # Yandex daemon-mode exception: the corporate build strips --load-extension,
+    # so the extension must arrive via ExtensionInstallForcelist (CRX). The
+    # relay_ws override still reaches the extension through the managed-storage
+    # policy (write_managed_policy), so writing the forcelist does not bypass
+    # the override. Chromium keeps the old unpacked+patch path.
+    if [ "${CEKI_DAEMON:-0}" != "1" ] || [ "${CEKI_PROVIDER_BROWSER:-}" != "yandex" ]; then
+      echo "[ceki-provider] extension: CEKI_WS_URL override — unpacked patching mode, no external policy"
+      return 0
+    fi
+    echo "[ceki-provider] extension: yandex daemon — keeping forcelist policy (relay via managed storage)"
   fi
   # Chromium (unbranded): external_update_url file in /usr/share/chromium/extensions.
   # Yandex Browser: only its corporate build honors policies, and only the
