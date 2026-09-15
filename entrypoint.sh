@@ -94,6 +94,61 @@ write_external_policy() {
   done
 }
 
+# --- Extension managed config (chrome.storage.managed) -------------------------
+# The extension reads its runtime config (relay_ws / backend_api / chat_api)
+# from the read-only managed-storage area populated by this policy file at
+# Chrome startup — configReady() in the extension merges these over the
+# build-time baked-in defaults. No HTTP, no probe: storage.managed is an
+# in-process IPC. Only fields that are set are written; unset fields keep the
+# build defaults, so a public CRX with no policy behaves byte-for-byte as today.
+#   CEKI_MANAGED_RELAY_WS  override relay_ws (default ws://127.0.0.1:<CEKI_DAEMON_PORT>/:17890)
+#   CEKI_MANAGED_BACKEND_API / CEKI_MANAGED_CHAT_API  optional overrides
+DAEMON_PORT="${CEKI_DAEMON_PORT:-17890}"
+write_managed_policy() {
+  # Extension id is stable (derived from the public manifest key) and matches
+  # the id Chrome computes for the policy-installed CRX. Build the policy
+  # object with python (safe JSON quoting); only set fields are written.
+  RELAY_WS_VAL="${CEKI_MANAGED_RELAY_WS:-ws://127.0.0.1:${DAEMON_PORT}}"
+  POLICY_JSON="$(python3 - "$EXT_ID" "$RELAY_WS_VAL" "${CEKI_MANAGED_BACKEND_API:-}" "${CEKI_MANAGED_CHAT_API:-}" <<'PYEOF'
+import json, sys
+ext_id, relay_ws = sys.argv[1], sys.argv[2]
+backend_api, chat_api = sys.argv[3], sys.argv[4]
+policy = {ext_id: {"relay_ws": relay_ws}}
+if backend_api:
+    policy[ext_id]["backend_api"] = backend_api
+if chat_api:
+    policy[ext_id]["chat_api"] = chat_api
+json.dump(policy, sys.stdout)
+PYEOF
+)"
+  # Unbranded Chromium reads its managed config from /etc/chromium/policies/managed.
+  mkdir -p /etc/chromium/policies/managed
+  printf '%s\n' "$POLICY_JSON" > /etc/chromium/policies/managed/ceki.json
+  echo "[ceki-provider] extension: managed policy -> /etc/chromium/policies/managed/ceki.json (relay_ws=$RELAY_WS_VAL)"
+  # Yandex Browser (corporate build) reads the same policy from its own root;
+  # the entrypoint already writes the forcelist there (write_external_policy).
+  # Merge the extension managed config into that file so the forcelist is kept:
+  #   {"ExtensionInstallForcelist": [...], "YandexProtectedMode": false, "<ext-id>": {...}}
+  if [ "${CEKI_PROVIDER_BROWSER:-}" = "yandex" ]; then
+    mkdir -p /etc/opt/yandex/browser/policies/managed
+    yandex_policy=/etc/opt/yandex/browser/policies/managed/ceki.json
+    if [ -f "$yandex_policy" ]; then
+      python3 - "$yandex_policy" "$POLICY_JSON" > "$yandex_policy.tmp" <<'PYEOF'
+import json, sys
+path, extra = sys.argv[1], sys.argv[2]
+data = json.load(open(path))
+for k, v in json.loads(extra).items():
+    data[k] = v
+json.dump(data, sys.stdout, indent=2)
+PYEOF
+      mv "$yandex_policy.tmp" "$yandex_policy"
+    else
+      printf '%s\n' "$POLICY_JSON" > "$yandex_policy"
+    fi
+    echo "[ceki-provider] extension: managed policy -> $yandex_policy (relay_ws=$RELAY_WS_VAL)"
+  fi
+}
+
 # --- Extension auto-update from the release channel ---------------------------
 # At every container start we fetch the latest extension CRX from the update
 # channel and unpack it over EXT_DIR, so the provider always runs the newest
@@ -149,6 +204,11 @@ update_extension() {
 # Primary path: write the external policy so Chrome installs + auto-updates the
 # extension itself. The unpacked download below only keeps the baked copy fresh
 # as a fallback when the external channel is unreachable (offline / local runs).
+#
+# Daemon mode (CEKI_DAEMON=1) loads the extension unpacked.
+# write_external_policy() bails on CEKI_EXT_SKIP_UPDATE=1 (the socket/IPC
+# rundown leaves no policy to remove), and update_extension() skips when
+# CEKI_EXT_SKIP_UPDATE is set; the api/ws URL patch right below still applies.
 write_external_policy
 update_extension
 
@@ -211,6 +271,28 @@ if [ -z "${CEKI_SKIP_BROWSER_UPDATE:-}" ] && command -v python3 >/dev/null 2>&1;
   if ! python3 -m playwright install chromium >/dev/null 2>&1; then
     echo "[ceki-provider] browser: playwright install check failed (continuing with baked build)" >&2
   fi
+fi
+
+# --- Managed config policy (daemon mode; overrides are meaningful only there) --
+# In daemon mode the extension's presence-WS must target the daemon's local
+# endpoint (ws://127.0.0.1:<port>) instead of the public relay. Stage 2 ships
+# that override through chrome.storage.managed (policy file below); the daemon
+# additionally patches its unpacked copy as a fallback (both idempotent, same
+# target). Legacy app.py mode keeps only the on-disk URL patching
+# (patch_extension_urls) and does not write managed policy.
+if [ "${CEKI_DAEMON:-0}" = "1" ]; then
+  write_managed_policy
+fi
+
+# --- Run mode ----------------------------------------------------------------
+# CEKI_DAEMON=1 → the SDK provider daemon (one provider-WS per schedule, one
+# Chrome per match). Everything above (Xvfb, extension policy/update, URL
+# patching) runs in both modes; only the process that becomes PID 1 differs.
+# Unset → legacy app.py launcher (default; still the prod path — it owns the
+# host-display sockets / ffmpeg streaming the daemon does not implement).
+if [ "${CEKI_DAEMON:-0}" = "1" ]; then
+  echo "[ceki-provider] run mode: daemon (ceki_browser_provider.daemon)"
+  exec python -m ceki_browser_provider.daemon
 fi
 
 exec "$@"

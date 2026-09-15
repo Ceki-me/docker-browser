@@ -18,13 +18,16 @@ second match while the daemon holds one session. The addressing by
 ``session_id`` is kept anyway so the parallel stage (stage 3) can be added
 without reworking the router.
 
-Extension / state-machine changes are explicitly OUT of scope (stage 2). The
-daemon gives the extension the right URLs the same way app.py/entrypoint do
-today: an unpacked copy of the extension dist is patched so ``relay_ws``
-points at the local daemon WS endpoint, and each instance Chrome is launched
-with ``--load-extension``. The external-policy path is not used by the daemon
-(a policy-installed CRX would carry the baked-in public URL and bypass the
-daemon).
+Extension URL configuration is delivered two ways (stage 2):
+1. managed storage — the entrypoint writes
+   ``/etc/chromium/policies/managed/ceki.json`` (unbranded Chromium) or
+   ``/etc/opt/yandex/browser/policies/managed/`` (Yandex), and the extension's
+   ``configReady()`` merges it over build defaults (``relay_ws`` →
+   ``ws://127.0.0.1:<daemon_port>``);
+2. as a fallback, the daemon still patches a copy of the unpacked dist so
+   ``relay_ws`` points at the local endpoint before ``--load-extension`` — this
+   covers Chrome builds that do not surface config-dir extension policies
+   (e.g. Chrome for Testing). Both deliver the same target and are idempotent.
 
 Profiles are wiped by default: tmpfs ``/sessions/<key>``, ``rm -rf`` on
 session end, startup sweep after a daemon crash. A ``persist`` env flag (NOT
@@ -82,8 +85,6 @@ _CHROME_ARGS = [
 
 # Token handshake is performed over CDP directly against the extension
 # service worker (see SpawnManager._handshake) — no JS snippet needed here.
-
-_WS_URL_RE = re.compile(r"wss?://[^\s'\"`]+")
 
 
 # ---------------------------------------------------------------------------
@@ -277,9 +278,8 @@ class SpawnManager:
         self.cfg = cfg
         self._instances: dict[str, Instance] = {}
         self._lock = threading.Lock()
-        self._patched_ext_path: str | None = None
-        self._patched_lock = threading.Lock()
         self._queued: dict[str, list[dict]] = {}
+        self._patch_stamp: str | None = None
         self._swept = False
 
     # -- public API (spec-shaped) ----------------------------------------------
@@ -420,32 +420,40 @@ class SpawnManager:
     # -- spawn internals --------------------------------------------------------
 
     def _patched_ext_dir(self) -> str:
-        with self._patched_lock:
-            if self._patched_ext_path:
-                return self._patched_ext_path
-            src = self.cfg.ext_dir
-            if not Path(src, "manifest.json").is_file():
-                raise RuntimeError(f"extension dist not found: {src}")
-            base = (
-                Path(self.cfg.session_dir)
-                if not self.cfg.persist
-                else Path(self.cfg.persist_session_dir)
-            )
-            base.mkdir(parents=True, exist_ok=True)
-            dst = str(base / "_ext-patched")
-            if not Path(dst, "manifest.json").is_file():
-                shutil.copytree(src, dst)
-                for f in Path(dst).rglob("*.js"):
-                    try:
-                        text = f.read_text()
-                    except Exception:
-                        continue
-                    new_text = text.replace(_DEFAULT_WS_URL, self.cfg.local_ws_url)
-                    if new_text != text:
-                        f.write_text(new_text)
-                log.info("extension patched: relay_ws -> %s", self.cfg.local_ws_url)
-            self._patched_ext_path = dst
-            return dst
+        # Stage 2 (managed storage): the entrypoint writes a policy file
+        # (chrome.storage.managed) that overrides relay_ws→daemon, but Chrome
+        # does not always surface config-dir extension policies (Chrome for
+        # Testing), so we ALSO patch the unpacked copy as a fallback — both
+        # deliver the same ws://127.0.0.1:<daemon_port> and are idempotent.
+        src = self.cfg.ext_dir
+        if not Path(src, "manifest.json").is_file():
+            raise RuntimeError(f"extension dist not found: {src}")
+        # Patch a copy under the session dir so the baked-in dist is never
+        # mutated (a fresh copy per daemon process, keyed by local_ws_url).
+        base = (
+            Path(self.cfg.session_dir)
+            if not self.cfg.persist
+            else Path(self.cfg.persist_session_dir)
+        )
+        base.mkdir(parents=True, exist_ok=True)
+        dst = str(base / "_ext-patched")
+        dst_p = Path(dst)
+        fresh = dst_p.joinpath("manifest.json").exists()
+        already = fresh and self._patch_stamp == self.cfg.local_ws_url
+        if not already:
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(src, dst)
+            for f in dst_p.rglob("*.js"):
+                try:
+                    text = f.read_text()
+                except OSError:
+                    continue
+                new_text = text.replace(_DEFAULT_WS_URL, self.cfg.local_ws_url)
+                if new_text != text:
+                    f.write_text(new_text)
+            self._patch_stamp = self.cfg.local_ws_url
+            log.info("extension patched: relay_ws -> %s", self.cfg.local_ws_url)
+        return dst
 
     def _chrome_binary(self) -> str:
         if self.cfg.browser_binary and Path(self.cfg.browser_binary).exists():
@@ -984,7 +992,8 @@ class ProviderWsClient:
 class LocalWsServer:
     """Local WS endpoint that extensions inside instances connect to.
 
-    Every instance Chrome is given a patched extension whose relay_ws points at
+    Every instance Chrome's extension is configured (via chrome.storage.managed
+    policy — see write_managed_policy in entrypoint) with relay_ws pointing at
     ws://127.0.0.1:<daemon_port>. Messages arriving here are multiplexed onto
     the single relay connection; relay messages are pushed into the right
     instance by the ProviderWsClient.
