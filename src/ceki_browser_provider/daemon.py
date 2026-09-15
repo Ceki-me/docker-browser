@@ -1,0 +1,1074 @@
+"""SDK Provider Daemon — one provider-WS per schedule, one Chrome per match.
+
+The daemon replaces the "one provider = one long-lived Chrome held by app.py"
+model with a thin WS multiplexor + process manager:
+
+  * exactly ONE provider WS connection to the relay is held for the schedule
+    (the same provider protocol app.py speaks today);
+  * a ``match`` from the relay spawns a dedicated Chrome instance — its own
+    Xvfb display, its own CDP port, its own profile dir under ``/sessions``
+    (tmpfs by default), with the live extension inside;
+  * the extension inside each Chrome speaks its presence-WS to the daemon's
+    local WS endpoint (instead of the relay); the daemon multiplexes every
+    message onto/off the single relay connection, keyed by ``session_id``.
+
+Stage 1 is strictly sequential: one active session. The relay gate
+(``provider.activeSession !== null`` → ``provider_busy``) already prevents a
+second match while the daemon holds one session. The addressing by
+``session_id`` is kept anyway so the parallel stage (stage 3) can be added
+without reworking the router.
+
+Extension / state-machine changes are explicitly OUT of scope (stage 2). The
+daemon gives the extension the right URLs the same way app.py/entrypoint do
+today: an unpacked copy of the extension dist is patched so ``relay_ws``
+points at the local daemon WS endpoint, and each instance Chrome is launched
+with ``--load-extension``. The external-policy path is not used by the daemon
+(a policy-installed CRX would carry the baked-in public URL and bypass the
+daemon).
+
+Profiles are wiped by default: tmpfs ``/sessions/<key>``, ``rm -rf`` on
+session end, startup sweep after a daemon crash. A ``persist`` env flag (NOT
+MVP, not documented) switches the base dir to a persistent mount
+(``/sessions-persist``) and disables both rm and sweep for those profiles.
+Host-side cron owns persist-profile cleanup; the daemon implements no quota/LRU.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import httpx
+import websockets
+
+from ceki_browser_provider import app as provider_app
+
+log = logging.getLogger("ceki.provider.daemon")
+
+# --- Defaults (mirror app.py / entrypoint) -------------------------------------
+
+_DEFAULT_EXT_ID = "gfionhbdkojjnjpbhlblopoaecdpllhb"
+_DEFAULT_WS_URL = "wss://browser.ceki.me/ws/provider"
+_DEFAULT_API_URL = "https://api.ceki.me"
+DAEMON_PORT_DEFAULT = 17890
+DEFAULT_CDP_PORT_START = 9223
+DEFAULT_DISPLAY_START = 101
+
+# Chrome flags reused from app.py's base set (identical semantics).
+_CHROME_ARGS = [
+    "--no-sandbox",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--use-fake-ui-for-media-stream",
+    "--use-fake-device-for-media-stream",
+    "--disable-blink-features=AutomationControlled",
+    "--lang=en-US",
+    "--window-position=0,0",
+]
+
+# Token handshake is performed over CDP directly against the extension
+# service worker (see SpawnManager._handshake) — no JS snippet needed here.
+
+_WS_URL_RE = re.compile(r"wss?://[^\s'\"`]+")
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DaemonConfig:
+    token: str
+    schedule_id: int | None
+    api_base: str
+    ext_dir: str
+    daemon_port: int
+    width: int
+    height: int
+    storage_key: str = "session_id"
+    persist: bool = False
+    session_dir: str = "/sessions"
+    persist_session_dir: str = "/sessions-persist"
+    max_sessions: int = 1
+    browser_binary: str | None = None
+    cdps: list[int] = field(default_factory=list)
+    displays: list[int] = field(default_factory=list)
+    local_ws_url: str = ""
+
+    @property
+    def relay_url(self) -> str:
+        """Provider-WS endpoint the daemon connects to (the same one the
+        extension build uses). Overridable via CEKI_WS_URL like entrypoint."""
+        return os.environ.get("CEKI_WS_URL") or _DEFAULT_WS_URL
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def load_config() -> DaemonConfig:
+    token = (
+        os.environ.get("CEKI_PROVIDER_TOKEN")
+        or os.environ.get("PROVIDER_TOKEN")
+        or ""
+    ).strip()
+    if not token:
+        raise SystemExit("ceki-provider-daemon: CEKI_PROVIDER_TOKEN is required")
+
+    api_base = (os.environ.get("CEKI_API_URL") or provider_app.default_api_url()).rstrip("/")
+    if api_base.endswith("/api"):
+        api_base = api_base[: -len("/api")]
+
+    ext_dir = (
+        os.environ.get("CEKI_PROVIDER_EXT_DIR")
+        or os.environ.get("CEKI_EXT_DIR")
+        or str(Path(provider_app.__file__).resolve().parent / "provider_assets" / "extension")
+    )
+
+    width, height = provider_app._parse_viewport(os.environ.get("CEKI_PROVIDER_VIEWPORT"))
+
+    schedule_id: int | None = None
+    raw_sid = os.environ.get("CEKI_PROVIDER_SCHEDULE_ID") or os.environ.get("PROVIDER_SCHEDULE_ID")
+    if raw_sid:
+        try:
+            schedule_id = int(raw_sid)
+        except ValueError:
+            schedule_id = None
+
+    max_sessions = int(os.environ.get("CEKI_DAEMON_MAX_SESSIONS", "1"))
+    cdp_start = int(os.environ.get("CEKI_DAEMON_CDP_START", str(DEFAULT_CDP_PORT_START)))
+    display_start = int(os.environ.get("CEKI_DAEMON_DISPLAY_START", str(DEFAULT_DISPLAY_START)))
+
+    storage_key = os.environ.get("CEKI_DAEMON_STORAGE_KEY", "session_id").strip().lower()
+    persist = _env_bool("CEKI_DAEMON_PERSIST", default=False)  # NOT documented (stage 5)
+    daemon_port = int(os.environ.get("CEKI_DAEMON_PORT", str(DAEMON_PORT_DEFAULT)))
+
+    cfg = DaemonConfig(
+        token=token,
+        schedule_id=schedule_id,
+        api_base=api_base,
+        ext_dir=ext_dir,
+        daemon_port=daemon_port,
+        width=width,
+        height=height,
+        storage_key=storage_key,
+        persist=persist,
+        session_dir=os.environ.get("CEKI_SESSION_DIR", "/sessions"),
+        persist_session_dir=os.environ.get("CEKI_SESSION_PERSIST_DIR", "/sessions-persist"),
+        max_sessions=max(1, max_sessions),
+        browser_binary=provider_app._browser_binary(),
+        cdps=list(range(cdp_start, cdp_start + max_sessions)),
+        displays=list(range(display_start, display_start + max_sessions)),
+    )
+    cfg.local_ws_url = f"ws://127.0.0.1:{cfg.daemon_port}"
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Instance + SpawnManager
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Instance:
+    session_id: str
+    storage_key: str
+    profile_dir: str
+    display: int
+    cdp_port: int
+    chrome_pid: int | None = None
+    xvfb_pid: int | None = None
+    ws: Any = None          # local WS server connection (extension side)
+    ready: bool = False
+    created_at: float = field(default_factory=time.time)
+
+
+def _pid_alive(pid: int) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _cmdlines() -> list[str]:
+    """Yield `cat /proc/<pid>/cmdline` joined by spaces for all live processes."""
+    out: list[str] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes().replace(b"\x00", b" ")
+            data = raw.decode("utf-8", "replace")
+        except Exception:
+            continue
+        if data.strip():
+            out.append((entry.name, data))
+    return [(pid, data) for pid, data in out]
+
+
+def _orphaned_chrome_procs(base_dirs: tuple[str, ...]) -> list[tuple[int, str]]:
+    """Find live chromium processes whose --user-data-dir is under any base_dir."""
+    found: list[tuple[int, str]] = []
+    for pid, data in _cmdlines():
+        if "user-data-dir" not in data:
+            continue
+        m = re.search(r"--user-data-dir=([^\s]+)", data)
+        if not m:
+            continue
+        udd = m.group(1)
+        if any(udd.startswith(b) for b in base_dirs):
+            try:
+                found.append((int(pid), udd))
+            except ValueError:
+                continue
+    return found
+
+
+def _procs_with_display(display: int) -> list[tuple[int, str]]:
+    """Find live processes running on an X display number (Xvfb instances)."""
+    found: list[tuple[int, str]] = []
+    for pid, data in _cmdlines():
+        if "Xvfb" not in data:
+            continue
+        if f":{display}" in data.split():
+            try:
+                found.append((int(pid), data))
+            except ValueError:
+                continue
+    return found
+
+
+class SpawnManager:
+    """Process manager + spawner. Interface mirrors the spec's SpawnManager:
+
+      ensure(sessionId, params)        → Instance
+      routeToRelay(sessionId, msg)     → (router handles)
+      routeToSession(sessionId, msg)   → (router handles)
+      destroy(sessionId, reason)       → kill Chrome+Xvfb, rm profile (unless persist)
+      active()                         → dict[session_id, Instance]
+    """
+
+    def __init__(self, cfg: DaemonConfig):
+        self.cfg = cfg
+        self._instances: dict[str, Instance] = {}
+        self._lock = threading.Lock()
+        self._patched_ext_path: str | None = None
+        self._patched_lock = threading.Lock()
+        self._queued: dict[str, list[dict]] = {}
+        self._swept = False
+
+    # -- public API (spec-shaped) ----------------------------------------------
+
+    def active(self) -> dict[str, Instance]:
+        with self._lock:
+            return dict(self._instances)
+
+    def ensure(self, session_id: str, params: dict) -> Instance | None:
+        """Return the live instance for ``session_id`` or spawn one.
+
+        A reconnect within an ACTIVE session finds the live instance and
+        reuses it (no re-spawn). Otherwise spawns Xvfb + Chrome and performs
+        the token handshake.
+        """
+        with self._lock:
+            inst = self._instances.get(session_id)
+            if inst is not None:
+                return inst
+            if len(self._instances) >= self.cfg.max_sessions:
+                log.warning("session %s: max_sessions reached, denying spawn", session_id)
+                return None
+            key = self._storage_key_for(session_id, params)
+            cdp = self.cfg.cdps.pop(0) if self.cfg.cdps else None
+            disp = self.cfg.displays.pop(0) if self.cfg.displays else None
+            if cdp is None or disp is None:
+                log.warning("session %s: no free CDP/display slot", session_id)
+                return None
+            inst = Instance(
+                session_id=session_id,
+                storage_key=key,
+                profile_dir=self._profile_path(key),
+                display=disp,
+                cdp_port=cdp,
+            )
+            self._instances[session_id] = inst
+
+        try:
+            self._spawn_and_handshake(inst, params)
+        except Exception as exc:
+            log.exception("session %s spawn failed: %s", session_id, exc)
+            self.destroy(session_id, "crashed")
+            return None
+        return inst
+
+    def destroy(self, session_id: str, reason: str) -> None:
+        with self._lock:
+            inst = self._instances.pop(session_id, None)
+        if inst is None:
+            return
+        self._kill_group(inst)
+        if not self.cfg.persist:
+            shutil.rmtree(inst.profile_dir, ignore_errors=True)
+            log.info("session %s destroyed (%s), profile removed", session_id, reason)
+        else:
+            log.info("session %s destroyed (%s), profile kept (persist)", session_id, reason)
+
+    def destroy_all(self, reason: str) -> None:
+        for sid in list(self.active().keys()):
+            self.destroy(sid, reason)
+
+    def _storage_key_for(self, session_id: str, params: dict) -> str:
+        """Resolve profile-dir key per the daemon config.
+
+        Default: ``session_id``. A composite ``billable_type:billable_id`` key
+        is built from those two fields of the match payload (user N and agent N
+        must not share a profile). Any other field of the payload is used
+        verbatim, falling back to session_id when absent.
+        """
+        sk = self.cfg.storage_key
+        if sk == "session_id":
+            return session_id
+        if ":" in sk:
+            a, b = sk.split(":", 1)
+            va, vb = params.get(a), params.get(b)
+            if va is not None and vb is not None:
+                return f"{va}:{vb}"
+        val = params.get(sk)
+        if val is not None:
+            return str(val)
+        return session_id
+
+    def _profile_path(self, key: str) -> str:
+        base = (
+            Path(self.cfg.session_dir)
+            if not self.cfg.persist
+            else Path(self.cfg.persist_session_dir)
+        )
+        base.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_.:@-]", "_", key)
+        return str(base / safe)
+
+    # -- local WS binding -------------------------------------------------------
+
+    def buffer(self, session_id: str, msg: dict) -> None:
+        """Queue a relay message for a session whose extension is not connected
+        yet (spawning / reconnecting). Flushed on WS bind."""
+        with self._lock:
+            self._queued.setdefault(session_id, []).append(msg)
+
+    def match_ws(self, ws: Any) -> Instance | None:
+        """Bind a new local WS connection (extension presence) to an instance.
+
+        Stage 1 (one session): a fresh connection belongs to the only instance
+        that is not yet connected. If an instance already has a live ws the
+        connection is still bound (the extension reconnects on the same session
+        and the old socket is closed by the peer naturally).
+        """
+        with self._lock:
+            for inst in self._instances.values():
+                if inst.ws is None or inst.ws.state == 3:  # CLOSED
+                    inst.ws = ws
+                    inst.ready = True
+                    return inst
+            # Overwrite: rebind the only instance (reconnect).
+            if len(self._instances) == 1:
+                inst = next(iter(self._instances.values()))
+                inst.ws = ws
+                inst.ready = True
+                return inst
+        return None
+
+    def take_buffer(self, session_id: str) -> list[dict]:
+        with self._lock:
+            return self._queued.pop(session_id, [])
+
+    @property
+    def queued_count(self) -> int:
+        with self._lock:
+            return sum(len(v) for v in self._queued.values())
+
+    # -- spawn internals --------------------------------------------------------
+
+    def _patched_ext_dir(self) -> str:
+        with self._patched_lock:
+            if self._patched_ext_path:
+                return self._patched_ext_path
+            src = self.cfg.ext_dir
+            if not Path(src, "manifest.json").is_file():
+                raise RuntimeError(f"extension dist not found: {src}")
+            base = (
+                Path(self.cfg.session_dir)
+                if not self.cfg.persist
+                else Path(self.cfg.persist_session_dir)
+            )
+            base.mkdir(parents=True, exist_ok=True)
+            dst = str(base / "_ext-patched")
+            if not Path(dst, "manifest.json").is_file():
+                shutil.copytree(src, dst)
+                for f in Path(dst).rglob("*.js"):
+                    try:
+                        text = f.read_text()
+                    except Exception:
+                        continue
+                    new_text = text.replace(_DEFAULT_WS_URL, self.cfg.local_ws_url)
+                    if new_text != text:
+                        f.write_text(new_text)
+                log.info("extension patched: relay_ws -> %s", self.cfg.local_ws_url)
+            self._patched_ext_path = dst
+            return dst
+
+    def _chrome_binary(self) -> str:
+        if self.cfg.browser_binary and Path(self.cfg.browser_binary).exists():
+            return self.cfg.browser_binary
+        # Fall back to Playwright's pinned Chromium.
+        try:
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as p:
+                exe = p.chromium.executable_path
+                if exe and Path(exe).exists():
+                    return exe
+        except Exception as exc:
+            log.warning("playwright resolve failed: %s", exc)
+        raise RuntimeError("no chrome binary available (CEKI_PROVIDER_BROWSER / playwright)")
+
+    def _build_chrome_args(self, inst: Instance, ext_dir: str) -> list[str]:
+        args = list(_CHROME_ARGS)
+        args.append(f"--window-size={self.cfg.width},{self.cfg.height}")
+        args.append(f"--user-data-dir={inst.profile_dir}")
+        args.append(f"--disk-cache-dir={inst.profile_dir}/cache")
+        args.append(f"--remote-debugging-port={inst.cdp_port}")
+        args.append("--remote-allow-origins=*")
+        args.append(f"--load-extension={ext_dir}")
+        args.append(f"--disable-extensions-except={ext_dir}")
+        return args
+
+    def _launch_chrome(self, inst: Instance, args: list[str]) -> subprocess.Popen:
+        env = dict(os.environ)
+        env["DISPLAY"] = f":{inst.display}"
+        proc = subprocess.Popen(
+            [self._chrome_binary(), *args],
+            env=env,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return proc
+
+    def _launch_xvfb(self, inst: Instance) -> subprocess.Popen:
+        # A previous run may have left an orphaned Xvfb on this display (its
+        # socket was unlinked but the process survived a hard kill). That
+        # stale process owns the display number and blocks a fresh Xvfb from
+        # starting — kill any live process whose cmdline carries this display
+        # before we unlink the socket.
+        stale = _procs_with_display(inst.display)
+        for pid, _data in stale:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                log.info("xvfb: killed stale process on :%d (pid %s)", inst.display, pid)
+            except (ProcessLookupError, PermissionError):
+                pass
+        sock = f"/tmp/.X{inst.display}-lock"
+        try:
+            os.unlink(sock)
+        except OSError:
+            pass
+        try:
+            os.unlink(f"/tmp/.X11-unix/X{inst.display}")
+        except OSError:
+            pass
+        env = dict(os.environ)
+        proc = subprocess.Popen(
+            [
+                "Xvfb",
+                f":{inst.display}",
+                "-screen",
+                "0",
+                f"{self.cfg.width}x{self.cfg.height}x24",
+                "-nolisten",
+                "tcp",
+            ],
+            env=env,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return proc
+
+    def _spawn_and_handshake(self, inst: Instance, params: dict) -> None:
+        """Blocking spawn: Xvfb + Chrome (two-launch incognito) + token handshake.
+
+        Mirrors app.py's two-launch incognito-grant + panel handshake, driving
+        the Chrome binary directly via subprocess and attaching over CDP for
+        the handshake (no Playwright persistent-context ownership).
+        """
+        ext_dir = self._patched_ext_dir()
+        profile = inst.profile_dir
+        Path(profile).mkdir(parents=True, exist_ok=True)
+        Path(profile, "Default").mkdir(parents=True, exist_ok=True)
+        Path(profile, "cache").mkdir(parents=True, exist_ok=True)
+
+        chrome_args = self._build_chrome_args(inst, ext_dir)
+
+        # 1) Xvfb on the instance display.
+        xvfb = self._launch_xvfb(inst)
+        inst.xvfb_pid = xvfb.pid
+        # Wait for the X socket.
+        x_sock = f"/tmp/.X11-unix/X{inst.display}"
+        for _ in range(40):
+            if os.path.exists(x_sock):
+                break
+            time.sleep(0.5)
+        else:
+            log.warning("X socket %s not ready after 20s, continuing", x_sock)
+
+        # 2) install phase: Chrome loads the extension, we learn the id.
+        proc1 = self._launch_chrome(inst, chrome_args)
+        inst.chrome_pid = proc1.pid
+        ext_id = self._discover_ext_id(inst, expected=_DEFAULT_EXT_ID, timeout=45)
+        # terminate install-phase Chrome cleanly before Preferences edit
+        self._kill_proc_group(proc1.pid)
+        self._wait_exit(proc1.pid)
+        inst.chrome_pid = None
+        if not ext_id:
+            self._kill_proc_group(xvfb.pid)
+            raise RuntimeError("could not discover extension id in install phase")
+
+        # 3) grant incognito access in Preferences (two-launch like app.py)
+        default_dir = Path(profile) / "Default"
+        prefs_path = default_dir / "Preferences"
+        try:
+            prefs = json.loads(prefs_path.read_text())
+        except Exception:
+            prefs = {}
+        settings = prefs.setdefault("extensions", {}).setdefault("settings", {})
+        entry = settings.setdefault(ext_id, {})
+        entry["incognito"] = True
+        entry["state"] = 1
+        prefs_path.write_text(json.dumps(prefs))
+        log.info("two-launch: incognito granted for %s", ext_id)
+
+        # 4) run phase: relaunch the same profile, now with incognito + token.
+        proc2 = self._launch_chrome(inst, chrome_args)
+        inst.chrome_pid = proc2.pid
+        self._discover_ext_id(inst, timeout=30)
+        # 5) token handshake via the extension panel over CDP.
+        self._handshake(inst)
+
+    def _discover_ext_id(self, inst: Instance, expected: str | None = None,
+                         timeout: float = 60) -> str | None:
+        """Wait for a chrome-extension:// target with the expected id.
+
+        Only the service-worker / page targets of the extension itself match;
+        other chrome-extension:// pages (built-in extensions) are ignored.
+        """
+        cdp = f"http://127.0.0.1:{inst.cdp_port}"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                resp = httpx.get(f"{cdp}/json/list", timeout=2)
+                targets = resp.json()
+            except Exception:
+                targets = []
+            for t in targets:
+                url = t.get("url") or ""
+                m = re.search(r"chrome-extension://([a-z]+)/", url)
+                if not m:
+                    continue
+                found = m.group(1)
+                if expected is None or found == expected:
+                    return found
+            time.sleep(0.5)
+        return None
+
+    def _handshake(self, inst: Instance) -> None:
+        """Store sanctum_token + ceki_browser in chrome.storage.local over CDP.
+
+        Drives the extension's service worker directly over the DevTools
+        protocol (no Playwright page round-trip): Runtime.evaluate with a
+        chrome.storage.local.set() payload. The SW's storage.onChanged handler
+        then pushes token_updated to the offscreen document, which opens the
+        presence-WS against the daemon's local endpoint.
+
+        Everything is a short-lived CDP attach; the Chrome process stays owned
+        by the daemon.
+        """
+        # The service worker may take a moment to spin up after launch; poll
+        # for it before giving up.
+        sw_ws = None
+        for _ in range(40):
+            sw_ws = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
+            if sw_ws is not None:
+                break
+            time.sleep(0.5)
+        if sw_ws is None:
+            sw_ws = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
+        if sw_ws is None:
+            log.warning("handshake: extension service worker target not found")
+            return
+
+        payload = {
+            "sanctum_token": self.cfg.token,
+            "ceki_browser": {"id": self.cfg.schedule_id or 0, "online": False, "name": ""},
+            "paired_at": int(time.time() * 1000),
+            "incognito_available": True,
+            "auto_accept": True,
+        }
+        expr = (
+            "chrome.storage.local.set("
+            + json.dumps(payload)
+            + ", () => true)"
+        )
+        try:
+            result = self._cdp_eval(sw_ws, expr)
+            log.info("handshake: storage set -> %s", json.dumps(result)[:200])
+        except Exception as exc:
+            log.warning("handshake failed: %s", exc)
+
+    def _find_target_ws(self, inst: Instance, kind: str, ext_id: str) -> str | None:
+        """Return the webSocketDebuggerUrl of the first target of ``kind`` whose
+        URL belongs to ``ext_id``."""
+        cdp = f"http://127.0.0.1:{inst.cdp_port}"
+        try:
+            targets = httpx.get(f"{cdp}/json/list", timeout=2).json()
+        except Exception:
+            return None
+        for t in targets:
+            if t.get("type") != kind:
+                continue
+            url = t.get("url") or ""
+            if f"chrome-extension://{ext_id}/" in url:
+                return t.get("webSocketDebuggerUrl")
+        return None
+
+    def _cdp_eval(self, ws_url: str, expression: str, timeout: float = 20.0) -> Any:
+        """Evaluate ``expression`` in a CDP target via its webSocketDebuggerUrl."""
+        async def _run() -> Any:
+            async with websockets.connect(ws_url, max_size=64 * 1024 * 1024) as sock:
+                request_id = 1
+                await sock.send(json.dumps({
+                    "id": request_id,
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": expression,
+                        "awaitPromise": True,
+                        "returnByValue": True,
+                    },
+                }))
+                while True:
+                    msg = json.loads(await asyncio.wait_for(sock.recv(), timeout=timeout))
+                    if msg.get("id") == request_id:
+                        if "error" in msg:
+                            raise RuntimeError(f"CDP error: {msg['error']}")
+                        res = msg.get("result", {}).get("result", {})
+                        return res.get("value")
+        return asyncio.run(_run())
+
+    def _kill_group(self, inst: Instance) -> None:
+        for pid in (inst.chrome_pid, inst.xvfb_pid):
+            if pid:
+                self._kill_proc_group(pid)
+        # grace then SIGKILL
+        for _ in range(20):
+            if not any(_pid_alive(pid) for pid in (inst.chrome_pid, inst.xvfb_pid) if pid):
+                break
+            time.sleep(0.5)
+        for pid in (inst.chrome_pid, inst.xvfb_pid):
+            if pid and _pid_alive(pid):
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+
+    def _kill_proc_group(self, pid: int) -> None:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def _wait_exit(self, pid: int, timeout: float = 15.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not _pid_alive(pid):
+                return
+            time.sleep(0.5)
+
+    # -- startup sweep ------------------------------------------------------------
+
+    def startup_sweep(self) -> None:
+        """Sweep leftovers from a previous daemon run (base mode only).
+
+        Kill orphaned chromium processes whose --user-data-dir points under the
+        active base dir, then (base mode) wipe the whole base dir. Persist mode:
+        kill only orphaned processes whose profile lives on the persist mount;
+        never touch tmpfs profiles or persist profile data (host cron owns that).
+        """
+        if self._swept:
+            return
+        self._swept = True
+        base = self.cfg.session_dir
+        persist = self.cfg.persist_session_dir
+
+        # Kill orphaned processes under either base (base) / persist mount (persist).
+        orphans = _orphaned_chrome_procs((base, persist))
+        for pid, udd in orphans:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                log.info("startup sweep: killed orphan chrome %s (%s)", pid, udd)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        if self.cfg.persist:
+            log.info("startup sweep: persist mode — profiles kept, orphan processes killed")
+            return
+
+        # Base mode: wipe /sessions/* (tmpfs leftovers of a crashed daemon).
+        if Path(base).exists():
+            for p in Path(base).iterdir():
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+            log.info("startup sweep: %s cleared", base)
+
+
+# ---------------------------------------------------------------------------
+# Daemon: async glue (provider-WS client + local WS server)
+# ---------------------------------------------------------------------------
+
+class Router:
+    """Thin session-id helper shared by the relay / extension glue.
+
+    Stage 1 keeps ``session_id`` as the lookup key so the parallel stage (3)
+    only has to widen the map — routing itself lives in ProviderWsClient /
+    LocalWsServer.
+    """
+
+    def __init__(self, spawner: SpawnManager):
+        self.spawner = spawner
+
+    def active_session_id(self) -> str | None:
+        act = self.spawner.active()
+        if not act:
+            return None
+        return next(iter(act), None)
+
+
+class ProviderWsClient:
+    """Provider-protocol WS client to the relay (single connection)."""
+
+    def __init__(self, cfg: DaemonConfig, spawner: SpawnManager, router: Router):
+        self.cfg = cfg
+        self.spawner = spawner
+        self.router = router
+        self.ws: Any = None
+        self._stop = False
+        self._reconnect_delay = 1.0
+
+    @property
+    def relay_url(self) -> str:
+        return self.cfg.relay_url
+
+    async def send(self, msg: dict | str) -> None:
+        ws = self.ws
+        if ws is None or ws.state != 1:  # OPEN
+            return
+        data = msg if isinstance(msg, str) else json.dumps(msg)
+        try:
+            await ws.send(data)
+        except Exception as exc:
+            log.warning("relay send failed: %s", exc)
+
+    async def _on_message(self, msg: dict) -> None:
+        mtype = msg.get("type")
+        if mtype == "ping":
+            await self.send({"type": "pong"})
+            return
+        if mtype == "provider.alive_probe":
+            await self.send({"type": "provider.alive_ack"})
+            return
+        if mtype == "match":
+            session_id = msg.get("session_id")
+            if not session_id:
+                log.warning("relay match without session_id, dropping")
+                return
+            inst = self.spawner.active().get(session_id)
+            if inst is None:
+                inst = await asyncio.to_thread(self.spawner.ensure, session_id, msg)
+            if inst is None:
+                return
+            await self._deliver(session_id, msg)
+            return
+        # other relay → session messages: route by session_id
+        session_id = msg.get("session_id")
+        if mtype == "cdp":
+            session_id = self.router.active_session_id()
+        if not session_id:
+            log.warning(
+                "relay -> %s without session_id (no active session), dropping", mtype
+            )
+            return
+        await self._deliver(session_id, msg)
+
+    async def _deliver(self, session_id: str, msg: dict) -> None:
+        inst = self.spawner.active().get(session_id)
+        if inst is None:
+            log.warning(
+                "relay -> %s for unknown session %s, dropping", msg.get("type"), session_id
+            )
+            return
+        ws = inst.ws
+        if ws is None or getattr(ws, "state", 3) != 1:
+            # The instance is still spawning / the extension is reconnecting.
+            # Buffer the message so it is delivered once the presence-WS is up
+            # (the match must not be lost — the extension only starts the
+            # rental window when it receives it).
+            if msg.get("type") in ("match", "cdp"):
+                self.spawner.buffer(session_id, msg)
+                log.info(
+                    "relay -> %s buffered for %s (extension not connected)",
+                    msg.get("type"), session_id,
+                )
+            else:
+                log.warning(
+                    "relay -> %s: instance %s not connected yet, dropping",
+                    msg.get("type"), session_id,
+                )
+            return
+        try:
+            await ws.send(json.dumps(msg))
+            if msg.get("type") in ("session_ended", "session.kill"):
+                # Relay closed the session (renter stop / backend reaper /
+                # session_kill): tear the instance down locally after delivery.
+                await asyncio.to_thread(
+                    self.spawner.destroy, session_id,
+                    "ended" if msg.get("type") == "session_ended" else "crashed",
+                )
+        except Exception as exc:
+            log.warning("relay -> %s send failed: %s", msg.get("type"), exc)
+
+    async def run(self) -> None:
+        while not self._stop:
+            try:
+                async with websockets.connect(
+                    self.relay_url,
+                    subprotocols=[f"bearer.{self.cfg.token}"],
+                    open_timeout=15,
+                    ping_interval=None,  # relay drives ping itself
+                ) as ws:
+                    self.ws = ws
+                    self._reconnect_delay = 1.0
+                    log.info("provider-ws: connected %s", self.relay_url)
+                    await self.send({
+                        "type": "welcome",
+                        "auto_accept": True,
+                        "capabilities": {"auto_accept": True},
+                        "active_session_id": self.router.active_session_id(),
+                    })
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        await self._on_message(msg)
+                    log.warning("provider-ws: relay closed the connection")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "provider-ws: error %s (reconnect in %.1fs)",
+                    exc, self._reconnect_delay,
+                )
+            if self._stop:
+                break
+            self.ws = None
+            await asyncio.sleep(self._reconnect_delay)
+            self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
+
+    def stop(self) -> None:
+        self._stop = True
+
+
+class LocalWsServer:
+    """Local WS endpoint that extensions inside instances connect to.
+
+    Every instance Chrome is given a patched extension whose relay_ws points at
+    ws://127.0.0.1:<daemon_port>. Messages arriving here are multiplexed onto
+    the single relay connection; relay messages are pushed into the right
+    instance by the ProviderWsClient.
+
+    Stage 1: the first fresh connection belongs to the (only) instance.
+    """
+
+    def __init__(self, cfg: DaemonConfig, spawner: SpawnManager, relay: ProviderWsClient):
+        self.cfg = cfg
+        self.spawner = spawner
+        self.relay = relay
+
+    async def handler(self, ws: Any, path: str) -> None:
+        # bind this connection to an instance (stage 1: first-come).
+        inst = self.spawner.match_ws(ws)
+        if inst is None:
+            log.warning("local-ws: no free instance to bind, closing connection")
+            await ws.close()
+            return
+        log.info("local-ws: extension connected for session %s", inst.session_id)
+        # Flush any relay messages buffered while the instance was spawning.
+        for buffered in self.spawner.take_buffer(inst.session_id):
+            try:
+                await ws.send(json.dumps(buffered))
+                log.info(
+                    "local-ws: flushed buffered %s to %s",
+                    buffered.get("type"), inst.session_id,
+                )
+            except Exception as exc:
+                log.warning("local-ws: flush failed: %s", exc)
+                break
+        try:
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                mtype = msg.get("type")
+                # heartbeat / presence handled locally
+                if mtype == "ping":
+                    await ws.send(json.dumps({"type": "pong"}))
+                    continue
+                if mtype == "welcome":
+                    # The extension announces itself; it also carries
+                    # active_session_id on reconnect — pass it through to the
+                    # relay untouched.
+                    pass
+                if mtype == "session_end":
+                    # The extension ended the rental. Forward to the relay (it
+                    # finishSession's) and tear the instance down locally.
+                    await self.relay.send(msg)
+                    await asyncio.to_thread(
+                        self.spawner.destroy, inst.session_id, "ended"
+                    )
+                    continue
+                # Everything else → relay (ext→relay direction).
+                await self.relay.send(msg)
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        finally:
+            log.info("local-ws: extension disconnected (session %s)", inst.session_id)
+            # If the extension dropped without session_end (crash / hard kill of
+            # the Chrome), tear the instance down. A reconnect replaces inst.ws
+            # with the new socket, so this must only fire when we still own it.
+            if self.spawner.active().get(inst.session_id) is inst and inst.ws is ws:
+                await asyncio.to_thread(self.spawner.destroy, inst.session_id, "crashed")
+
+
+class Daemon:
+    def __init__(self, cfg: DaemonConfig):
+        self.cfg = cfg
+        self.spawner = SpawnManager(cfg)
+        self.router = Router(self.spawner)
+        self.relay = ProviderWsClient(cfg, self.spawner, self.router)
+        self.local = LocalWsServer(cfg, self.spawner, self.relay)
+        self._stop_event = threading.Event()
+        self._server = None
+
+    async def _run(self) -> None:
+        self.spawner.startup_sweep()
+        async def _log_request(connection, request_headers):
+            if request_headers is None:
+                log.warning(
+                    "local-ws: invalid handshake (no headers) from %s",
+                    getattr(connection, "remote_address", "?"),
+                )
+            return None  # never pre-empt; handler decides
+
+        server = await websockets.serve(
+            self.local.handler,
+            "127.0.0.1",
+            self.cfg.daemon_port,
+            ping_interval=None,
+            # The extension always connects with a `bearer.<token>` subprotocol
+            # (same as it does against the real relay). websockets only
+            # negotiates a subprotocol when the server advertises at least one
+            # (`available_subprotocols` gate), so list the expected one; the
+            # select callback just picks whatever the extension offered so a
+            # token rotation never drops a handshake. NB: select_subprotocol is
+            # called as (client_subprotocols, server_subprotocols).
+            subprotocols=[f"bearer.{self.cfg.token}"],
+            select_subprotocol=lambda client, _server: client[0] if client else None,
+            process_request=_log_request,
+            max_size=16 * 1024 * 1024,
+        )
+        self._server = server
+        log.info("local-ws: listening on ws://127.0.0.1:%d", self.cfg.daemon_port)
+        relay_task = asyncio.create_task(self.relay.run())
+        try:
+            while not self._stop_event.is_set():
+                await asyncio.sleep(1)
+        finally:
+            relay_task.cancel()
+            try:
+                await relay_task
+            except asyncio.CancelledError:
+                pass
+            server.close()
+            await server.wait_closed()
+            self.spawner.destroy_all("shutdown")
+
+    def run(self) -> int:
+        try:
+            asyncio.run(self._run())
+        except KeyboardInterrupt:
+            pass
+        return 0
+
+
+def _setup_logging() -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
+    logger = logging.getLogger("ceki.provider")
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    level = os.environ.get("CEKI_PROVIDER_LOG_LEVEL", "").upper()
+    logger.setLevel(getattr(logging, level, logging.INFO) if level else logging.INFO)
+    logger.propagate = False
+
+
+def main(argv: list[str] | None = None) -> int:
+    _setup_logging()
+    cfg = load_config()
+    log.info(
+        "daemon: schedule=%s sessions=%d cdp_pool=%s..%s displays=%s..%s storage_key=%s persist=%s",
+        cfg.schedule_id,
+        cfg.max_sessions,
+        cfg.cdps[0], cfg.cdps[-1],
+        cfg.displays[0], cfg.displays[-1],
+        cfg.storage_key,
+        cfg.persist,
+    )
+    daemon = Daemon(cfg)
+    return daemon.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
