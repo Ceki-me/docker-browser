@@ -914,7 +914,7 @@ class ProviderWsClient:
             await self._deliver(session_id, msg)
             return
         # other relay → session messages: route by session_id
-        session_id = msg.get("session_id")
+        session_id = msg.get("session_id") or msg.get("event_id")
         if mtype == "cdp":
             session_id = self.router.active_session_id()
         if not session_id:
