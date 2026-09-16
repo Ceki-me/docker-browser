@@ -1012,10 +1012,20 @@ class ProviderWsClient:
         ws = inst.ws
         if ws is None or getattr(ws, "state", 3) != 1:
             # The instance is still spawning / the extension is reconnecting.
-            # Buffer the message so it is delivered once the presence-WS is up
-            # (the match must not be lost — the extension only starts the
-            # rental window when it receives it).
-            if msg.get("type") in ("match", "cdp"):
+            # Buffer the message so it is delivered once the presence-WS is up.
+            # match must not be lost (the extension only starts the rental
+            # window when it receives it), and WebRTC signaling (offer / answer
+            # / ice_candidate) is one-shot from the agent — the agent does not
+            # resend, so dropping it leaves the P2P bridge never established.
+            # take_buffer preserves append order, so match → offer → ICE arrive
+            # in the order the relay delivered them.
+            if msg.get("type") in (
+                "match",
+                "cdp",
+                "webrtc.offer",
+                "webrtc.answer",
+                "webrtc.ice_candidate",
+            ):
                 self.spawner.buffer(session_id, msg)
                 log.info(
                     "relay -> %s buffered for %s (extension not connected)",
