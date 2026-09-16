@@ -87,6 +87,37 @@ _CHROME_ARGS = [
 # service worker (see SpawnManager._handshake) — no JS snippet needed here.
 
 
+# Browser flavor the provider runs. Mirrors provider_app._BROWSER_FLAVOR: the
+# image selects it via CEKI_PROVIDER_BROWSER ('yandex' | 'pseudo-yandex' |
+# 'chromium'), defaulting to unbranded Chromium. The flavor is advertised in
+# the welcome packet so the relay/backend can show the real browser instead of
+# a generic "Chrome Linux".
+_FLAVOR_ALIASES = {
+    "chromium": "chrome",        # unbranded Playwright Chromium → "chrome"
+    "yandex": "yandex",          # real YaBrowser (corporate build)
+    "pseudo-yandex": "yandex",   # Chromium posing as YaBrowser → reports yandex
+}
+_FLAVOR_NAMES = {
+    "chrome": "Chrome",
+    "yandex": "Yandex Browser",
+}
+
+
+def provider_browser_flavor() -> str:
+    """Canonical flavor key advertised in welcome / stored in settings.
+
+    Maps the launcher's CEKI_PROVIDER_BROWSER value onto the user-facing key:
+    unbranded Chromium reports "chrome", yandex/pseudo-yandex report "yandex".
+    """
+    raw = os.environ.get("CEKI_PROVIDER_BROWSER", "chromium").strip().lower()
+    return _FLAVOR_ALIASES.get(raw, "chrome")
+
+
+def provider_browser_name() -> str:
+    """Human-readable browser name for ceki_browser.name / settings.browser_name."""
+    return _FLAVOR_NAMES.get(provider_browser_flavor(), "Chrome")
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -661,7 +692,12 @@ class SpawnManager:
 
         payload = {
             "sanctum_token": self.cfg.token,
-            "ceki_browser": {"id": self.cfg.schedule_id or 0, "online": False, "name": ""},
+            "ceki_browser": {
+                "id": self.cfg.schedule_id or 0,
+                "online": False,
+                "name": provider_browser_name(),
+                "flavor": provider_browser_flavor(),
+            },
             "paired_at": int(time.time() * 1000),
             "incognito_available": True,
             "auto_accept": True,
@@ -1022,6 +1058,8 @@ class ProviderWsClient:
                         "type": "welcome",
                         "auto_accept": True,
                         "capabilities": {"auto_accept": True},
+                        "browser_flavor": provider_browser_flavor(),
+                        "browser_name": provider_browser_name(),
                         "active_session_id": self.router.active_session_id(),
                     })
                     # Concurrent message handling: a dedicated reader task
