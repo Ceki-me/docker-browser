@@ -704,6 +704,31 @@ class SpawnManager:
         if off_ws is None:
             log.warning("handshake: offscreen target never appeared, token may be lost")
             return
+
+        # Give the offscreen a moment to deliver the first token set into its
+        # presence-WS. If the extension already connected, the handshake
+        # succeeded — do NOT clear the token. The offscreen treats token=null
+        # as an intentional close (offscreen.ts onTokenFromSw), and the local
+        # WS handler would then misread that disconnect as a crash and destroy
+        # the instance mid-spawn (the parallel-rent crash, ev 9095: 2nd/3rd
+        # session destroyed (crashed) right after extension connected, token
+        # re-set failed with Connect call failed on the port).
+        for _ in range(6):  # up to ~3s for the WS to come up
+            ws = inst.ws
+            if ws is not None and getattr(ws, "state", 3) == 1:
+                log.info(
+                    "handshake: presence-WS already connected, token delivered — skipping re-delivery"
+                )
+                return
+            time.sleep(0.5)
+
+        # Re-check right before the destructive clear: if the extension
+        # connected during the window above (token was delivered), skip.
+        ws = inst.ws
+        if ws is not None and getattr(ws, "state", 3) == 1:
+            log.info("handshake: presence-WS connected during wait, skipping re-delivery")
+            return
+
         # Clear then re-set: onChanged fires token_cleared then token_updated,
         # now delivering into the live offscreenPort.
         try:
@@ -961,6 +986,26 @@ class ProviderWsClient:
         except Exception as exc:
             log.warning("relay -> %s send failed: %s", msg.get("type"), exc)
 
+    async def _read_loop(self, ws: Any, inbox: asyncio.Queue) -> None:
+        """Read + decode relay frames into ``inbox`` (one task per message).
+
+        On socket close, a ``None`` sentinel is queued after the drained frames
+        so the consumer loop exits and the reconnect path runs.
+        """
+        try:
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                await inbox.put(msg)
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        except asyncio.CancelledError:
+            raise
+        finally:
+            inbox.put_nowait(None)
+
     async def run(self) -> None:
         while not self._stop:
             try:
@@ -979,13 +1024,33 @@ class ProviderWsClient:
                         "capabilities": {"auto_accept": True},
                         "active_session_id": self.router.active_session_id(),
                     })
-                    async for raw in ws:
-                        try:
-                            msg = json.loads(raw)
-                        except Exception:
-                            continue
-                        await self._on_message(msg)
-                    log.warning("provider-ws: relay closed the connection")
+                    # Concurrent message handling: a dedicated reader task
+                    # decodes frames off the relay socket into an unbounded
+                    # queue, and each message is processed in its own task.
+                    # This keeps the loop responsive while a `match` handler is
+                    # awaiting a slow spawn (asyncio.to_thread) — otherwise the
+                    # single `async for` would hold the whole relay socket until
+                    # the spawn finished, so a concurrent `provider.alive_probe`
+                    # / `ping` (ev 9095 parallel rents) would sit unread past
+                    # the relay's 2.5s probe timeout and the relay would mark
+                    # the provider offline for the 2nd/3rd session.
+                    inbox: asyncio.Queue = asyncio.Queue()
+                    reader = asyncio.create_task(self._read_loop(ws, inbox))
+                    handlers: set[asyncio.Task] = set()
+                    try:
+                        while True:
+                            msg = await inbox.get()
+                            if msg is None:  # sentinel: socket closed, drain done
+                                break
+                            t = asyncio.create_task(self._on_message(msg))
+                            handlers.add(t)
+                            t.add_done_callback(handlers.discard)
+                    finally:
+                        reader.cancel()
+                        for t in list(handlers):
+                            t.cancel()
+                        await asyncio.gather(reader, *handlers, return_exceptions=True)
+                        log.warning("provider-ws: relay closed the connection")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1051,10 +1116,18 @@ class LocalWsServer:
                     await ws.send(json.dumps({"type": "pong"}))
                     continue
                 if mtype == "welcome":
-                    # The extension announces itself; it also carries
-                    # active_session_id on reconnect — pass it through to the
-                    # relay untouched.
-                    pass
+                    # The extension announces itself. Its welcome must NOT be
+                    # forwarded to the relay: the relay (providerRouter) treats
+                    # ANY welcome from the provider WS as the provider's
+                    # capability announcement and overwrites auto_accept /
+                    # price_per_min with it. The extension's welcome carries the
+                    # panel's own auto_accept (false until the SW pushes state),
+                    # so forwarding it clobbers the daemon's real
+                    # auto_accept=true and the relay starts sending manual
+                    # `offer`s (which the daemon does not answer) → offer_timeout
+                    # on parallel rents (ev 9095). Only the daemon's own welcome
+                    # (sent once on provider-WS connect) announces capabilities.
+                    continue
                 if mtype == "session_end":
                     # The extension ended the rental. Forward to the relay (it
                     # finishSession's) and tear the instance down locally.
@@ -1116,18 +1189,46 @@ class Daemon:
         self._server = server
         log.info("local-ws: listening on ws://127.0.0.1:%d", self.cfg.daemon_port)
         relay_task = asyncio.create_task(self.relay.run())
+        watchdog = asyncio.create_task(self._spawn_watchdog())
         try:
             while not self._stop_event.is_set():
                 await asyncio.sleep(1)
         finally:
             relay_task.cancel()
-            try:
-                await relay_task
-            except asyncio.CancelledError:
-                pass
+            watchdog.cancel()
+            for t in (relay_task, watchdog):
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
             server.close()
             await server.wait_closed()
             self.spawner.destroy_all("shutdown")
+
+    async def _spawn_watchdog(self) -> None:
+        """Destroy instances whose extension never connected within a timeout.
+
+        Under parallel load (ev 9095) a spawned Chrome can occasionally fail to
+        get its extension's presence-WS up (offscreen/extension init slowness on
+        the 3rd+ concurrent spawn). Without a watchdog such an instance holds
+        its CDP/display slot (and profile) forever — the renter's session.end
+        can't reach the daemon (no local-WS to relay it) and the slot leaks.
+        Periodically reap instances that are older than the connect timeout and
+        still not ``ready``.
+        """
+        connect_timeout = int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90"))
+        while True:
+            await asyncio.sleep(5)
+            for session_id, inst in self.spawner.active().items():
+                if inst.ready:
+                    continue
+                age = time.time() - inst.created_at
+                if age > connect_timeout:
+                    log.warning(
+                        "watchdog: session %s extension never connected after %.0fs — reaping",
+                        session_id, age,
+                    )
+                    await asyncio.to_thread(self.spawner.destroy, session_id, "crashed")
 
     def run(self) -> int:
         try:
