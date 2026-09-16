@@ -18,16 +18,22 @@ second match while the daemon holds one session. The addressing by
 ``session_id`` is kept anyway so the parallel stage (stage 3) can be added
 without reworking the router.
 
-Extension URL configuration is delivered two ways (stage 2):
+Extension URL configuration is delivered three ways (stage 2 + ev 9362):
 1. managed storage — the entrypoint writes
    ``/etc/chromium/policies/managed/ceki.json`` (unbranded Chromium) or
    ``/etc/opt/yandex/browser/policies/managed/`` (Yandex), and the extension's
    ``configReady()`` merges it over build defaults (``relay_ws`` →
    ``ws://127.0.0.1:<daemon_port>``);
-2. as a fallback, the daemon still patches a copy of the unpacked dist so
+2. local-storage runtime override — the daemon's CDP handshake writes
+   ``ceki_runtime_config.relay_ws`` into chrome.storage.local (same channel as
+   sanctum_token). This is the RELIABLE path on branded builds (Yandex
+   corporate) that do NOT surface config-dir managed policy into
+   chrome.storage.managed; the extension's configReady() reads it with highest
+   precedence (ev 9362);
+3. as a fallback, the daemon still patches a copy of the unpacked dist so
    ``relay_ws`` points at the local endpoint before ``--load-extension`` — this
    covers Chrome builds that do not surface config-dir extension policies
-   (e.g. Chrome for Testing). Both deliver the same target and are idempotent.
+   (e.g. Chrome for Testing). All deliver the same target and are idempotent.
 
 Profiles are wiped by default: tmpfs ``/sessions/<key>``, ``rm -rf`` on
 session end, startup sweep after a daemon crash. A ``persist`` env flag (NOT
@@ -701,6 +707,17 @@ class SpawnManager:
             "paired_at": int(time.time() * 1000),
             "incognito_available": True,
             "auto_accept": True,
+        }
+        # Local relay endpoint override (ev 9362). Some branded builds (Yandex
+        # corporate) do NOT surface config-dir managed policy into
+        # chrome.storage.managed, so the managed-policy path alone cannot point
+        # the extension's presence-WS at this daemon's local endpoint. Deliver
+        # it over the same reliable channel as the token — chrome.storage.local
+        # via CDP — under a dedicated key the extension's configReady() reads
+        # with highest precedence. Backend/chat defaults come from the build /
+        # managed policy; only the local relay_ws differs per daemon.
+        payload["ceki_runtime_config"] = {
+            "relay_ws": self.cfg.local_ws_url,
         }
         expr = (
             "chrome.storage.local.set("
