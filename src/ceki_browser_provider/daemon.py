@@ -87,6 +87,20 @@ _CHROME_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--lang=en-US",
     "--window-position=0,0",
+    # Idle-rent memory/CPU: without these, Yandex opens ya.ru as the home
+    # page plus its native chrome://wallpaper / alissenger-bubble surfaces —
+    # ~5 renderer processes / ~1.9GB for an otherwise-blank rent. Keep the
+    # session tab blank until the extension navigates it (about:blank).
+    # NOTE: --disable-background-networking is deliberately NOT set here —
+    # the policy-installed CRX (ExtensionInstallForcelist) relies on Chrome's
+    # background update check to download/refresh the extension.
+    "--homepage=about:blank",
+    "--no-pings",
+    "--disable-sync",
+    "--disable-session-crashed-bubble",
+    "--disable-component-update",
+    "--disable-background-mode",
+    "--disable-features=AlessengerBubble,Wallpaper,DesktopBackgroundMode",
 ]
 
 # Token handshake is performed over CDP directly against the extension
@@ -242,6 +256,7 @@ class Instance:
     xvfb_pid: int | None = None
     ws: Any = None          # local WS server connection (extension side)
     ready: bool = False
+    profile_mode: str | None = None  # 'main' | 'incognito' (None → incognito semantics)
     created_at: float = field(default_factory=time.time)
 
 
@@ -356,9 +371,10 @@ class SpawnManager:
             inst = Instance(
                 session_id=session_id,
                 storage_key=key,
-                profile_dir=self._profile_path(key),
+                profile_dir=self._profile_path(key, params.get("profile_mode")),
                 display=disp,
                 cdp_port=cdp,
+                profile_mode=params.get("profile_mode"),
             )
             self._instances[session_id] = inst
 
@@ -382,7 +398,12 @@ class SpawnManager:
             self.cfg.cdps.append(inst.cdp_port)
         if inst.display not in self.cfg.displays and len(self.cfg.displays) < self.cfg.max_sessions:
             self.cfg.displays.append(inst.display)
-        if not self.cfg.persist:
+        # Persist decision is per-session by profile_mode, not global: a 'main'
+        # rent keeps its profile (persistent, keyed by billable), an incognito /
+        # unset rent is ephemeral and its profile is removed on end. Falls back
+        # to the global cfg.persist when profile_mode is unset (legacy mode).
+        keep_profile = inst.profile_mode == "main" if inst.profile_mode else self.cfg.persist
+        if not keep_profile:
             shutil.rmtree(inst.profile_dir, ignore_errors=True)
             log.info("session %s destroyed (%s), profile removed", session_id, reason)
         else:
@@ -401,23 +422,30 @@ class SpawnManager:
         verbatim, falling back to session_id when absent.
         """
         sk = self.cfg.storage_key
-        if sk == "session_id":
+        # main-rents persist under the billable key (stable across rents of the
+        # same owner/agent); incognito/unset rents use session_id (ephemeral).
+        if params.get("profile_mode") == "main" and sk == "session_id":
             return session_id
-        if ":" in sk:
-            a, b = sk.split(":", 1)
-            va, vb = params.get(a), params.get(b)
-            if va is not None and vb is not None:
-                return f"{va}:{vb}"
-        val = params.get(sk)
-        if val is not None:
-            return str(val)
+        if params.get("profile_mode") == "main":
+            if ":" in sk:
+                a, b = sk.split(":", 1)
+                va, vb = params.get(a), params.get(b)
+                if va is not None and vb is not None:
+                    return f"{va}:{vb}"
+            val = params.get(sk)
+            if val is not None:
+                return str(val)
+        # incognito / unset: ephemeral per-session profile
         return session_id
 
-    def _profile_path(self, key: str) -> str:
+    def _profile_path(self, key: str, profile_mode: str | None = None) -> str:
+        # main-rents persist under /sessions-persist; incognito/unset are
+        # ephemeral under /sessions (even in a persist-configured container).
+        is_main = profile_mode == "main"
         base = (
-            Path(self.cfg.session_dir)
-            if not self.cfg.persist
-            else Path(self.cfg.persist_session_dir)
+            Path(self.cfg.persist_session_dir if is_main else self.cfg.session_dir)
+            if self.cfg.persist
+            else Path(self.cfg.session_dir)
         )
         base.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9_.:@-]", "_", key)
@@ -431,15 +459,23 @@ class SpawnManager:
         with self._lock:
             self._queued.setdefault(session_id, []).append(msg)
 
-    def match_ws(self, ws: Any) -> Instance | None:
+    def match_ws(self, ws: Any, session_id: str | None = None) -> Instance | None:
         """Bind a new local WS connection (extension presence) to an instance.
 
-        Stage 1 (one session): a fresh connection belongs to the only instance
-        that is not yet connected. If an instance already has a live ws the
-        connection is still bound (the extension reconnects on the same session
-        and the old socket is closed by the peer naturally).
+        With parallel sessions the extension carries its rent's session_id as a
+        query param (offscreen appends `?session_id=`), so we match by THAT id
+        first — "first free instance" is racy and can bind an extension to the
+        wrong rent's Chrome, killing the real session. Fall back to the old
+        behaviour (first instance with no live ws, or rebind when only one)
+        for clients that don't send the param / reconnect within a session.
         """
         with self._lock:
+            if session_id:
+                inst = self._instances.get(session_id)
+                if inst is not None:
+                    inst.ws = ws
+                    inst.ready = True
+                    return inst
             for inst in self._instances.values():
                 if inst.ws is None or inst.ws.state == 3:  # CLOSED
                     inst.ws = ws
@@ -533,6 +569,18 @@ class SpawnManager:
         return args
 
     def _launch_chrome(self, inst: Instance, args: list[str]) -> subprocess.Popen:
+        # A previous run on a PERSIST profile may have left stale Chrome
+        # singleton locks (SingletonLock/SingletonSocket/SingletonCookie) after a
+        # hard kill. Chrome treats those as "profile in use by another instance"
+        # and can fail to open + reach the extension target (discover fails).
+        # Remove them so a fresh launch on the same persisted profile works.
+        for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            try:
+                p = Path(inst.profile_dir) / lock
+                if p.exists() or p.is_symlink():
+                    p.unlink()
+            except OSError:
+                pass
         env = dict(os.environ)
         env["DISPLAY"] = f":{inst.display}"
         proc = subprocess.Popen(
@@ -643,6 +691,11 @@ class SpawnManager:
         self._discover_ext_id(inst, timeout=30)
         # 5) token handshake via the extension panel over CDP.
         self._handshake(inst)
+        # 6) opportunistic: drop Yandex's default background tabs (ya.ru,
+        #    chrome://wallpaper, alissenger) that eat ~1GB on an idle rent.
+        #    Deferred so the extension's session tab (about:blank) opens first;
+        #    failures are non-fatal.
+        threading.Timer(2.0, self._close_idle_tabs, args=(inst,)).start()
 
     def _discover_ext_id(self, inst: Instance, expected: str | None = None,
                          timeout: float = 60) -> str | None:
@@ -852,6 +905,53 @@ class SpawnManager:
                         res = msg.get("result", {}).get("result", {})
                         return res.get("value")
         return asyncio.run(_run())
+
+    def _close_idle_tabs(self, inst: Instance) -> None:
+        """Close Yandex's default background surfaces after launch.
+
+        A fresh Yandex profile opens its home page (ya.ru) plus the native
+        chrome://wallpaper / chrome://alissenger-bubble / chrome://ntp surfaces
+        on first run — ~4-5 renderer processes / ~700MB-1GB of an otherwise
+        blank rent. The session tab is opened separately by the extension
+        (about:blank or the rent URL), so these default tabs are pure overhead.
+        Close every non-extension ``page`` target that isn't the session tab,
+        freeing that memory. Purely opportunistic — failures are ignored.
+        """
+        keep_urls = (
+            "about:blank",
+            f"chrome-extension://{_DEFAULT_EXT_ID}/",
+            "chrome://newtab",
+        )
+        cdp = f"http://127.0.0.1:{inst.cdp_port}"
+        deadline = time.time() + 30
+        closed = 0
+        while time.time() < deadline:
+            try:
+                targets = httpx.get(f"{cdp}/json/list", timeout=2).json()
+            except Exception:
+                time.sleep(0.5)
+                continue
+            found = False
+            for t in targets:
+                url = t.get("url") or ""
+                if t.get("type") != "page":
+                    continue
+                if any(url.startswith(p) for p in keep_urls):
+                    continue
+                if not url:
+                    continue
+                try:
+                    httpx.get(f"{cdp}/json/close/{t.get('id')}", timeout=2)
+                    log.info("close_idle: closed %s", url[:80])
+                    closed += 1
+                    found = True
+                except Exception:
+                    pass
+            if not found:
+                break
+            time.sleep(0.3)
+        if closed:
+            log.info("close_idle: closed %d background tab(s)", closed)
 
     def _kill_group(self, inst: Instance) -> None:
         for pid in (inst.chrome_pid, inst.xvfb_pid):
@@ -1151,8 +1251,31 @@ class LocalWsServer:
         self.relay = relay
 
     async def handler(self, ws: Any, path: str) -> None:
-        # bind this connection to an instance (stage 1: first-come).
-        inst = self.spawner.match_ws(ws)
+        # bind this connection to an instance. Multi-rent: the extension sends
+        # its rent's session_id as a query param so we bind by session, not
+        # "first free" (which is racy with N parallel instances).
+        session_id = None
+        # path may or may not include the query depending on websockets version;
+        # also try the request object when available.
+        candidates = []
+        if path:
+            candidates.append(path)
+        try:
+            req_path = ws.request.path if ws.request else None
+            if req_path:
+                candidates.append(req_path)
+        except Exception:
+            pass
+        for p in candidates:
+            if p and '?' in p:
+                qs = p.split('?', 1)[1]
+                for pair in qs.split('&'):
+                    if pair.startswith('session_id='):
+                        session_id = pair.split('=', 1)[1]
+                        break
+            if session_id:
+                break
+        inst = self.spawner.match_ws(ws, session_id)
         if inst is None:
             log.warning("local-ws: no free instance to bind, closing connection")
             await ws.close()
@@ -1201,7 +1324,14 @@ class LocalWsServer:
                         self.spawner.destroy, inst.session_id, "ended"
                     )
                     continue
-                # Everything else → relay (ext→relay direction).
+                # Everything else → relay (ext→relay direction). Some extension
+                # builds send webrtc.answer/ice_candidate with an EMPTY
+                # session_id (fallback `?? ""` in p2p-manager when
+                # _activeSessionId is unset) — the relay then can't route them
+                # to the renter (signaling: no peer map for ""), so P2P never
+                # completes. Backfill the session_id from the bound instance.
+                if isinstance(msg, dict) and not msg.get("session_id"):
+                    msg = {**msg, "session_id": inst.session_id}
                 await self.relay.send(msg)
         except websockets.exceptions.ConnectionClosed:
             pass
@@ -1316,6 +1446,24 @@ def _setup_logging() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     _setup_logging()
+    # Reap zombie children. We are PID 1 in the container: no init will collect
+    # them, so every destroyed Chrome/Xvfb left a zombie behind. Accumulated
+    # zombies hog pid/process-table and slow the host — with parallel spawns the
+    # Nth Chrome loses resources and its extension never connects. SIGCHLD fires
+    # on child exit; waitpid(-1, WNOHANG) drains everything ready to reap.
+    def _on_sigchld(_signum, _frame):
+        try:
+            while True:
+                pid, _status = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+        except (ChildProcessError, OSError):
+            pass
+
+    try:
+        signal.signal(signal.SIGCHLD, _on_sigchld)
+    except Exception:
+        pass
     cfg = load_config()
     log.info(
         "daemon: schedule=%s sessions=%d cdp_pool=%s..%s displays=%s..%s storage_key=%s persist=%s",
