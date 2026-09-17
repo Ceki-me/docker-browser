@@ -914,15 +914,29 @@ class SpawnManager:
         on first run — ~4-5 renderer processes / ~700MB-1GB of an otherwise
         blank rent. The session tab is opened separately by the extension
         (about:blank or the rent URL), so these default tabs are pure overhead.
-        Close every non-extension ``page`` target that isn't the session tab,
-        freeing that memory. Purely opportunistic — failures are ignored.
+
+        Only known Yandex garbage surfaces are closed, and never the active /
+        foreground tab. An earlier allowlist (close everything that is not
+        about:blank / extension / newtab) closed the SESSION tab once the
+        extension navigated it to a real URL — e.g. close_idle closed
+        https://www.google.com/ ~2s after match → session destroyed →
+        user_stop (dev sessions 11418/11419). Purely opportunistic — failures
+        are ignored.
         """
-        keep_urls = (
-            "about:blank",
-            f"chrome-extension://{_DEFAULT_EXT_ID}/",
-            "chrome://newtab",
-        )
+        # Never touch tabs once this instance is paired to a live rent — the
+        # session tab may already be navigated to a real URL by the extension,
+        # and closing it kills the session (user_stop). The trim is only meant
+        # for the startup window before the first match.
+        if inst.ws is not None or (inst.session_id and self.active().get(inst.session_id) is inst):
+            log.info("close_idle: skip (session already active for %s)", inst.session_id)
+            return
         cdp = f"http://127.0.0.1:{inst.cdp_port}"
+        garbage_prefixes = (
+            "chrome://wallpaper",
+            "chrome://alissenger-bubble",
+            "chrome://ntp",
+        )
+        home_hosts = ("ya.ru", "yandex.ru")
         deadline = time.time() + 30
         closed = 0
         while time.time() < deadline:
@@ -936,10 +950,16 @@ class SpawnManager:
                 url = t.get("url") or ""
                 if t.get("type") != "page":
                     continue
-                if any(url.startswith(p) for p in keep_urls):
-                    continue
                 if not url:
                     continue
+                if t.get("active"):
+                    continue  # never close the foreground/session tab
+                low = url.lower()
+                if not (
+                    any(low.startswith(p) for p in garbage_prefixes)
+                    or any(h in low for h in home_hosts)
+                ):
+                    continue  # not known garbage — leave it alone
                 try:
                     httpx.get(f"{cdp}/json/close/{t.get('id')}", timeout=2)
                     log.info("close_idle: closed %s", url[:80])
