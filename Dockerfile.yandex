@@ -91,13 +91,21 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Provider launcher module (this repo).
 COPY src/ /opt/ceki/src/
 
-# Yandex Browser: the CORPORATE deb from the official repo. Pinned implicitly
-# by the pool snapshot at build time. The deb ships /usr/bin/yandex-browser.
+# Yandex Browser: the CORPORATE deb from the official repo. The repo only
+# serves the latest build, and newer Yandex versions (26.8+) have broken the
+# Ceki extension (extension never connects → rent stuck). The only known-good
+# version is the corporate 26.6.x (verified 2026-09-18 on ceki/provider:yandex-daemon-c266).
+# apt cannot pin an older version (repo doesn't keep them), so we HARD-FAIL the
+# build if the install resolves to anything but 26.6.* — never silently ship a
+# broken newer browser.
 RUN wget -qO- https://repo.yandex.ru/yandex-browser/YANDEX-BROWSER-KEY.GPG \
         | gpg --dearmor -o /usr/share/keyrings/yandex-browser.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/yandex-browser.gpg] https://repo.yandex.ru/yandex-browser/deb stable main" \
         > /etc/apt/sources.list.d/yandex-browser.list \
     && apt-get update && apt-get install -y --no-install-recommends yandex-browser-corporate \
+    && VER="$(yandex-browser --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)" \
+    && echo "yandex-browser-corporate resolved to: $(yandex-browser --version 2>/dev/null)" \
+    && case "$VER" in 26.6) echo "OK: yandex 26.6 (known-good corporate build)";; *) echo "FATAL: yandex $VER != 26.6 — corporate 26.6 is the only build the extension supports. Do NOT ship this image."; exit 1;; esac \
     && rm -rf /var/lib/apt/lists/*
 
 # Playwright's Chromium stays installed as a fallback binary (app.py falls back
