@@ -448,7 +448,7 @@ class SpawnManager:
             else Path(self.cfg.session_dir)
         )
         base.mkdir(parents=True, exist_ok=True)
-        safe = re.sub(r"[^A-Za-z0-9_.:@-]", "_", key)
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", key)
         return str(base / safe)
 
     # -- local WS binding -------------------------------------------------------
