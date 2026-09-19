@@ -83,34 +83,77 @@ jobs:
       - name: Compute tags
         id: tags
         run: |
-          # latest is always pushed; the release tag (and Hub tags) only exist
-          # on a real Release — on workflow_dispatch there is no tag_name.
-          {
-            echo "ghcr.io/ceki-me/docker-browser:latest"
-            if [ "${{ steps.hubcheck.outputs.enabled }}" = "1" ]; then
-              echo "ceki/provider:latest"
-            fi
-          } > /tmp/tags
-          if [ -n "${{ github.event.release.tag_name }}" ]; then
+          # Three images, one per browser flavor (each its own Dockerfile):
+          #   chromium (Dockerfile)                    -> :latest, :<tag>
+          #   yandex (Dockerfile.yandex)               -> :yandex, :<tag>-yandex
+          #   pseudo-yandex (Dockerfile.pseudo-yandex) -> :pseudo-yandex, :<tag>-pseudo-yandex
+          # The flavor tags are always pushed; the release tag (and Hub tags)
+          # only exist on a real Release — on workflow_dispatch there is no
+          # tag_name.
+          HUB="${{ steps.hubcheck.outputs.enabled }}"
+          write_set() { # $1 = flavor suffix ("", -yandex, -pseudo-yandex)
+            local suffix="$1"
+            # File name mirrors the GITHUB_OUTPUT key: hyphens -> underscores
+            # (tags_yandex), and the chromium set (empty suffix) -> tags_chromium.
+            local file_suffix="${suffix//-/_}"
+            file_suffix="${file_suffix:-_chromium}"
             {
-              echo "ghcr.io/ceki-me/docker-browser:${{ github.event.release.tag_name }}"
-              if [ "${{ steps.hubcheck.outputs.enabled }}" = "1" ]; then
-                echo "ceki/provider:${{ github.event.release.tag_name }}"
+              if [ -z "$suffix" ]; then
+                echo "ghcr.io/ceki-me/docker-browser:latest"
+              else
+                echo "ghcr.io/ceki-me/docker-browser:${suffix#-}"
               fi
-            } >> /tmp/tags
-          fi
-          {
-            echo "tags<<__CEKI_EOF__"
-            cat /tmp/tags
-            echo "__CEKI_EOF__"
-          } >> "$GITHUB_OUTPUT"
+              if [ "$HUB" = "1" ]; then
+                if [ -z "$suffix" ]; then
+                  echo "ceki/provider:latest"
+                else
+                  echo "ceki/provider:${suffix#-}"
+                fi
+              fi
+              if [ -n "${{ github.event.release.tag_name }}" ]; then
+                echo "ghcr.io/ceki-me/docker-browser:${{ github.event.release.tag_name }}${suffix}"
+                if [ "$HUB" = "1" ]; then
+                  echo "ceki/provider:${{ github.event.release.tag_name }}${suffix}"
+                fi
+              fi
+            } > "/tmp/tags${file_suffix}"
+          }
+          write_set ""
+          write_set "-yandex"
+          write_set "-pseudo-yandex"
+          # Output names use underscores (tags_yandex, not tags-yandex):
+          # hyphens in expression identifiers are parsed as subtraction.
+          for s in _chromium _yandex _pseudo_yandex; do
+            {
+              echo "tags${s}<<__CEKI_EOF__"
+              cat "/tmp/tags${s}"
+              echo "__CEKI_EOF__"
+            } >> "$GITHUB_OUTPUT"
+          done
 
-      - name: Build and push
+      - name: Build and push (chromium)
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile
           push: true
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: ${{ steps.tags.outputs.tags_chromium }}
+
+      - name: Build and push (yandex)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.yandex
+          push: true
+          tags: ${{ steps.tags.outputs.tags_yandex }}
+
+      - name: Build and push (pseudo-yandex)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.pseudo-yandex
+          push: true
+          tags: ${{ steps.tags.outputs.tags_pseudo_yandex }}
 
       - name: Make GHCR package public
         # GHCR creates container packages private by default, even in a public

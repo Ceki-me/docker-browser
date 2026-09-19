@@ -8,3 +8,10 @@ __pycache__/
 build/
 dist/
 .venv/
+
+# Local dev-only compose + overlay files (contain dev URLs/tokens — untracked on purpose).
+docker-compose.dev*.yml
+Dockerfile.dev-daemon-overlay
+
+# Local persist-profile bind dir (real Chrome profiles, never commit).
+.persist-sessions/
