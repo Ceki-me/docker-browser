@@ -1093,6 +1093,7 @@ class ProviderWsClient:
 
     async def _on_message(self, msg: dict) -> None:
         mtype = msg.get("type")
+        log.info("relay-in: type=%s sid=%s route_sid=%s", mtype, msg.get("session_id") or msg.get("event_id"), self.router.active_session_id())
         if mtype == "ping":
             await self.send({"type": "pong"})
             return
@@ -1104,16 +1105,34 @@ class ProviderWsClient:
             if not session_id:
                 log.warning("relay match without session_id, dropping")
                 return
+            # CRITICAL: buffer the match BEFORE the long ensure/spawn. The
+            # spawn takes ~10s (Xvfb + two-launch Chrome); meanwhile a CDP
+            # (navigate) from the renter lands in the buffer and is flushed on
+            # extension connect. If match is only delivered after ensure
+            # returns, it arrives AFTER the buffered cdp was already flushed →
+            # extension gets navigate before match → no _pendingSession →
+            # no_session. Buffering match up-front guarantees the flush serves
+            # match first (order preserved, match-first sort in _deliver).
             inst = self.spawner.active().get(session_id)
-            if inst is None:
-                inst = await asyncio.to_thread(self.spawner.ensure, session_id, msg)
-            if inst is None:
+            if inst is None or inst.ws is None:
+                self.spawner.buffer(session_id, msg)
+                log.info("relay -> match buffered UPFRONT for %s", session_id)
+                if inst is None:
+                    try:
+                        await asyncio.to_thread(self.spawner.ensure, session_id, msg)
+                    except Exception as match_exc:
+                        log.error("relay-in: match ensure EXC %s: %r", session_id, match_exc)
+                        return
                 return
             await self._deliver(session_id, msg)
             return
         # other relay → session messages: route by session_id
         session_id = msg.get("session_id") or msg.get("event_id")
-        if mtype == "cdp":
+        if mtype == "cdp" and not session_id:
+            # Relay always stamps renter→provider CDP with session_id (cdp.ts:
+            # withSessionId) so parallel sessions route to the correct browser
+            # instance. active_session_id() is only a legacy fallback for a
+            # CDP without one (single-session providers).
             session_id = self.router.active_session_id()
         if not session_id:
             log.warning(
@@ -1302,7 +1321,16 @@ class LocalWsServer:
             return
         log.info("local-ws: extension connected for session %s", inst.session_id)
         # Flush any relay messages buffered while the instance was spawning.
-        for buffered in self.spawner.take_buffer(inst.session_id):
+        # CRITICAL ordering: the extension only creates the rental window when
+        # it has a `match` (sets _pendingSession). A CDP/navigate that arrives
+        # before the match (renter sends navigate right after match, while the
+        # extension is still spawning — seen as `cdp buffered` earlier than
+        # `match buffered`) would otherwise be applied with no pending session
+        # → `no_session` (-1051). Always deliver `match` first, then the rest
+        # in arrival order.
+        buffered_msgs = self.spawner.take_buffer(inst.session_id)
+        buffered_msgs.sort(key=lambda m: 0 if m.get("type") == "match" else 1)
+        for buffered in buffered_msgs:
             try:
                 await ws.send(json.dumps(buffered))
                 log.info(
