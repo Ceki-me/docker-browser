@@ -1099,6 +1099,7 @@ class ProviderWsClient:
             return
         if mtype == "provider.alive_probe":
             await self.send({"type": "provider.alive_ack"})
+            log.info("[heartbeat] online=online elapsed=%ds", int(time.time() - self._started_at))
             return
         if mtype == "match":
             session_id = msg.get("session_id")
