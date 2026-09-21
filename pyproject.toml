@@ -14,10 +14,12 @@ keywords = ["browser", "provider", "ceki", "docker", "automation"]
 dependencies = [
     "ceki-sdk==2.36.1",
     "playwright>=1.40",
+    "websockets>=12",
 ]
 
 [project.scripts]
 ceki-provider = "ceki_browser_provider.app:main"
+ceki-provider-daemon = "ceki_browser_provider.daemon:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ceki_browser_provider"]

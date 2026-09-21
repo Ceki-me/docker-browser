@@ -1,20 +1,23 @@
 # syntax=docker/dockerfile:1
 #
-# Ceki headless-browser provider image — CHROMIUM flavor (default).
+# Ceki headless-browser provider image — PSEUDO-YANDEX flavor.
 #
-# Runs the provider launcher (src/ceki_browser_provider):
-#   * Chromium (Playwright) — the rented public browser
-#   * the ceki browser extension (dist) — the provider agent inside the browser
-#   * the provider launcher — launches Chromium + extension, injects the token
-#     and keeps the browser online until a renter connects or the process stops
+# Same image as Dockerfile (chromium): Playwright's Chromium, but the provider
+# patches the browser identity to look like Yandex Browser — the YaBrowser UA
+# string plus Client Hints (brands, fullVersionList, platform), applied per
+# page via CDP Network.setUserAgentOverride in app.py when
+# CEKI_PROVIDER_BROWSER=pseudo-yandex.
 #
-# The browser token is passed at runtime via CEKI_PROVIDER_TOKEN.
+# NOT a real Yandex build — no Yandex internals, config channels or ytrust.
+# Fine where only the UA matters (Yandex services that check the string);
+# anything probing deeper (Yandex's own fingerprinting, ytrust TLS) will see
+# through it. For the real thing use Dockerfile.yandex.
 #
 # Build context = repo root. `build.sh` stages the extension dist into
 # extension/ (git-ignored) before `docker build`.
 #
-# Sibling images: Dockerfile.yandex (real Yandex Browser),
-# Dockerfile.pseudo-yandex (Chromium with a YaBrowser UA).
+# Sibling images: Dockerfile (chromium, default), Dockerfile.yandex (real
+# Yandex Browser).
 
 FROM python:3.11-slim
 
@@ -26,16 +29,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /opt/ceki
 
-# OCI annotations link the GHCR image to this repository, so the image shows
-# under the repo's Packages tab and Actions' GITHUB_TOKEN can manage it
-# (visibility, deletion). Without a source label the image is orphaned.
 LABEL org.opencontainers.image.source=https://github.com/Ceki-me/docker-browser \
-      org.opencontainers.image.title=ceki-browser-provider \
-      org.opencontainers.image.description="Ceki headless-browser provider image: Chromium + browser extension + provider launcher"
+      org.opencontainers.image.title=ceki-browser-provider-pseudo-yandex \
+      org.opencontainers.image.description="Ceki headless-browser provider image: Chromium with a YaBrowser UA + browser extension + provider launcher"
 
-# Chromium runtime libraries + Xvfb virtual display (Chromium needs a display to
-# run as a "visible" provider browser; Xvfb provides it headlessly).
-# libnss3-tools: certutil for the NSS trust DB — see the Russian Trusted CA block.
+# Chromium runtime libraries + Xvfb virtual display + libnss3-tools (certutil
+# for the NSS trust DB — see the CA block).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libnss3 libnspr4 libnss3-tools libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
         libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 \
@@ -43,25 +42,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libglib2.0-0 libgdk-pixbuf-2.0-0 xvfb xauth x11-utils ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Russian Trusted Root CA / Sub CA (Минцифры, НУЦ) — the CA that sanctioned
-# RU banks/sites (sberbank.ru, tbank, gov services) switched to after Western
-# CAs stopped serving them. Not in the Mozilla/Chrome root programs, so plain
-# Chromium fails those sites with ERR_CERT_AUTHORITY_INVALID (Yandex Browser
-# ships this root in its own build, which is why the yandex image opens them
-# without any of this). Install into both trust paths:
-#   - system CA bundle (update-ca-certificates) → curl/python/requests inside
-#     the container, and Chromium when no NSS user DB exists
-#   - the machine-wide NSS DB (/etc/pki/nssdb) → Chromium's "locally managed
-#     roots" policy (Chrome on Linux reads NSS DBs in addition to its own
-#     root store; local roots skip the CT/public-audit requirements)
-# Chromium probes the *user's* ~/.pki/nssdb first and falls back to the
-# machine-wide /etc/pki/nssdb — the container runs as root, so /root/.pki/nssdb
-# is seeded too (both DBs, so a different USER works as well).
-# Source: gu-st.ru (Mintsifry's own hosting), fetched at build time — the certs
-# are NOT committed to the repo. Each download is pinned to its sha256 (DER
-# form): a rotated/compromised cert on gu-st.ru fails the build instead of
-# silently installing a foreign root. On a legitimate CA rotation bump the
-# pins below (a root-CA rotation is exactly the kind of event worth noticing).
+# Russian Trusted Root CA / Sub CA (Минцифры, НУЦ) — see Dockerfile for the
+# full rationale and the pinning scheme. Fetched at build time from gu-st.ru,
+# pinned by sha256 (DER).
 ARG RU_ROOT_CA_SHA256=d26d2d0231b7c39f92cc738512ba54103519e4405d68b5bd703e9788ca8ecf31
 ARG RU_SUB_CA_SHA256=bbbde2103e790b999ec62bd03cf625a5a2e7c316e10afe6a490eedead8b3fd9b
 RUN set -eu; \
@@ -98,10 +81,9 @@ COPY src/ /opt/ceki/src/
 # Chromium pinned by Playwright — the provider browser on this image.
 RUN python -m playwright install chromium
 
-# This image rents out Playwright's Chromium (app.py reads the env to pick the
-# binary; settable at runtime, e.g. CEKI_PROVIDER_BROWSER=pseudo-yandex is
-# meaningless here — the YaBrowser UA patch lives on the pseudo-yandex image).
-ENV CEKI_PROVIDER_BROWSER=chromium
+# This image rents out Chromium with the YaBrowser UA patch (app.py applies
+# the UA + Client Hints per page when the flavor is pseudo-yandex).
+ENV CEKI_PROVIDER_BROWSER=pseudo-yandex
 
 # Bundled browser extension dist (staged into extension/ by build.sh).
 COPY extension/ /opt/ceki/extension/

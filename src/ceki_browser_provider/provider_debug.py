@@ -56,7 +56,14 @@ class DebugConfig:
     ping_timeout: float = _DEFAULT_PING_TIMEOUT
 
     def chrome_args(self) -> list[str]:
-        return [f"--remote-debugging-port={self.port}"]
+        # --remote-allow-origins: CDP ws clients that send an Origin header
+        # (python websocket-client, browser devtools front-ends) are rejected
+        # with 403 otherwise. The port is loopback-only inside the container,
+        # so a wildcard is safe here.
+        return [
+            f"--remote-debugging-port={self.port}",
+            "--remote-allow-origins=*",
+        ]
 
 
 def config_from_env() -> DebugConfig | None:

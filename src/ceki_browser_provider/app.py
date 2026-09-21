@@ -111,12 +111,140 @@ _LOAD_EXT_ARGS = [
 
 # Where Chrome looks for an external-extension policy (unbranded Chromium):
 # the JSON file named <extension-id>.json with an external_update_url.
+# Yandex Browser (corporate build) does not read these paths at all — its own
+# managed-policy root and the ExtensionInstallForcelist form are handled
+# separately (see _external_policy_update_url and the entrypoint).
 _EXTERNAL_POLICY_DIRS = [
     "/usr/share/chromium/extensions",
     "/etc/chromium/extensions",
     "/usr/share/chrome/extensions",
     "/etc/opt/chrome/extensions",
 ]
+
+# Browser flavor selection. The image ships Playwright's Chromium as the
+# default provider browser; the yandex flavor (image ceki/provider:yandex)
+# adds Yandex Browser and selects it via env — the same launcher code drives
+# either binary.
+_BROWSER_FLAVORS = {
+    "chromium": None,  # None → Playwright's pinned Chromium (default)
+    "yandex": "/usr/bin/yandex-browser",
+    # pseudo-yandex: plain Playwright Chromium pretending to be YaBrowser —
+    # UA string + Client Hints override at launch (see _UA_OVERRIDE / apply).
+    # NOT a real Yandex build: no Yandex internals, ytrust, config channels.
+    "pseudo-yandex": None,
+}
+
+# pseudo-yandex UA. Yandex Browser's UA format is
+#   ...Chrome/<base> YaBrowser/<major>.<minor>.0.0 Safari/537.36
+# (stable 26.8.1 → "Chrome/150.0.0.0 YaBrowser/26.8.0.0"; verified live).
+# The Chromium major here tracks the current Yandex stable major; bump it
+# when rebuilding the image. Chrome full version below must match the
+# Playwright Chromium major actually in the image (JS APIs, Sec-CH-UA).
+_PSEUDO_UA_CHROMIUM_MAJOR = "150"
+_PSEUDO_UA_CHROMIUM_FULL = "151.0.7922.34"
+_PSEUDO_YABROWSER_MAJOR = "26"
+_PSEUDO_YABROWSER_MINOR = "8"
+_PSEUDO_UA = (
+    f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    f"Chrome/{_PSEUDO_UA_CHROMIUM_MAJOR}.0.0.0 "
+    f"YaBrowser/{_PSEUDO_YABROWSER_MAJOR}.{_PSEUDO_YABROWSER_MINOR}.0.0 Safari/537.36"
+)
+
+
+def _apply_ua_override(context: Any) -> None:
+    """pseudo-yandex: pin the UA string and Client Hints on every existing page.
+
+    ``user_agent=`` at launch covers the HTTP header and navigator.userAgent;
+    Client Hints (navigator.userAgentData, Sec-CH-UA headers) are a separate
+    layer and would otherwise expose the real Chromium — overridden per page
+    via the CDP Network domain. Runs best-effort: any failure logs and moves
+    on rather than blocking provider startup.
+    """
+    if _BROWSER_FLAVOR != "pseudo-yandex":
+        return
+    brands = [
+        {"brand": "Not A(Brand", "version": "99.0.0.0"},
+        {"brand": "Yandex", "version": f"{_PSEUDO_YABROWSER_MAJOR}.{_PSEUDO_YABROWSER_MINOR}.0.0"},
+        {"brand": "Chromium", "version": _PSEUDO_UA_CHROMIUM_MAJOR},
+    ]
+
+    def patch(page: Any) -> None:
+        try:
+            _apply_ua_override_single(page)
+        except Exception as exc:
+            log.debug("ua override failed on a page: %s", exc)
+
+    pages = list(getattr(context, "pages", []))
+    for page in pages:
+        patch(page)
+    if pages:
+        log.info("pseudo-yandex: UA override applied to %d page(s)", len(pages))
+
+
+def _apply_ua_override_to_page(page: Any) -> None:
+    """``page`` event handler: patch UA/Client Hints on a newly-opened page.
+
+    The CDP session must be created after the page's session exists; on the
+    very first moment of a page's life the target may not be attached yet, so
+    retry briefly. Navigation itself does not reset the Network-domain override.
+    """
+    for _ in range(10):
+        try:
+            _apply_ua_override_single(page)
+            return
+        except Exception:
+            time.sleep(0.3)
+    log.debug("pseudo-yandex: gave up UA override for a new page")
+
+
+def _apply_ua_override_single(page: Any) -> None:
+    """Patch one page's UA + Client Hints via a fresh CDP session."""
+    session = page.context.new_cdp_session(page)
+    brands = [
+        {"brand": "Not A(Brand", "version": "99.0.0.0"},
+        {"brand": "Yandex", "version": f"{_PSEUDO_YABROWSER_MAJOR}.{_PSEUDO_YABROWSER_MINOR}.0.0"},
+        {"brand": "Chromium", "version": _PSEUDO_UA_CHROMIUM_MAJOR},
+    ]
+    session.send(
+        "Network.setUserAgentOverride",
+        {
+            "userAgent": _PSEUDO_UA,
+            "acceptLanguage": "en-US,en;q=0.9",
+            "userAgentMetadata": {
+                "brands": brands,
+                "fullVersionList": brands,
+                "fullVersion": _PSEUDO_UA_CHROMIUM_FULL,
+                "platform": "Linux",
+                "platformVersion": "6.1.0",
+                "architecture": "x86",
+                "model": "",
+                "mobile": False,
+                "bitness": "64",
+                "wow64": False,
+            },
+        },
+    )
+_BROWSER_FLAVOR = os.environ.get("CEKI_PROVIDER_BROWSER", "chromium").strip().lower()
+
+
+def _browser_binary() -> str | None:
+    """Executable path for the provider browser (None = Playwright Chromium)."""
+    if _BROWSER_FLAVOR not in _BROWSER_FLAVORS:
+        log.warning(
+            "CEKI_PROVIDER_BROWSER=%r unknown (known: %s); using Chromium",
+            _BROWSER_FLAVOR,
+            ", ".join(_BROWSER_FLAVORS),
+        )
+        return None
+    binary = _BROWSER_FLAVORS[_BROWSER_FLAVOR]
+    if binary and not Path(binary).exists():
+        log.warning(
+            "CEKI_PROVIDER_BROWSER=yandex but %s missing (chromium image?); "
+            "falling back to Playwright Chromium",
+            binary,
+        )
+        return None
+    return binary
 
 # JS helpers injected into the extension panel page.  ``arg`` is supplied by
 # Playwright when the arrow function is evaluated (see page.evaluate).
@@ -367,19 +495,44 @@ def _ensure_timezone() -> None:
 
 
 def _external_policy_update_url() -> str | None:
-    """Return the ``external_update_url`` of the external-extension policy, if any.
+    """Return the update-channel URL of the external-extension policy, if any.
 
-    Chrome installs and auto-updates an extension from a JSON policy file named
-    ``<extension-id>.json`` placed in a policy directory (e.g.
-    ``/usr/share/chromium/extensions/``). When such a policy exists we launch
-    Chromium without ``--load-extension`` and let Chrome itself install the
-    extension from the update channel — which also means Chrome keeps updating
-    it in the background (checks every few hours), the point of this whole mode.
+    Chromium (unbranded): a JSON file named ``<extension-id>.json`` in a policy
+    directory (e.g. ``/usr/share/chromium/extensions/``) with an
+    ``external_update_url`` — Chrome installs and auto-updates the extension
+    from that channel. When such a policy exists we launch Chromium without
+    ``--load-extension`` and let Chrome itself install the extension — which
+    also means Chrome keeps updating it in the background (checks every few
+    hours), the point of this whole mode.
+
+    Yandex Browser (corporate build, yandex flavor): only the managed-policy
+    root works, and only the ``ExtensionInstallForcelist`` form — the policy
+    file is ``/etc/opt/yandex/browser/policies/managed/ceki.json`` written by
+    the entrypoint, listing ``<id>;<updates.xml>`` pairs.
 
     Returns ``None`` when no policy is found (then the launcher falls back to
     the unpacked ``--load-extension`` path).
     """
-    for d in _EXTERNAL_POLICY_DIRS:
+    # Yandex corporate-policy root first (its forcelist form), then the
+    # chromium external_update_url files.
+    yandex_policy = Path("/etc/opt/yandex/browser/policies/managed")
+    if _BROWSER_FLAVOR == "yandex" and yandex_policy.is_dir():
+        try:
+            for f in yandex_policy.glob("*.json"):
+                try:
+                    data = json.loads(f.read_text())
+                except Exception:
+                    continue
+                for entry in data.get("ExtensionInstallForcelist") or []:
+                    if isinstance(entry, str) and ";" in entry:
+                        _ext_id, url = entry.split(";", 1)
+                        if url:
+                            log.info("external extension policy (yandex forcelist): %s -> %s", f, url)
+                            return url
+        except OSError:
+            pass
+    dirs = list(_EXTERNAL_POLICY_DIRS)
+    for d in dirs:
         p = Path(d)
         if not p.is_dir():
             continue
@@ -542,6 +695,47 @@ def _poll_online(
     return "offline"
 
 
+def _maximize_window(page: Any) -> None:
+    """Force the browser window to the full framebuffer via CDP.
+
+    Xvfb runs without a window manager, so --start-maximized is a no-op and
+    Playwright appends its own default --window-size=1280,800 after our args
+    (that one wins on the command line). Browser.setWindowBounds is applied by
+    Chromium itself through X11 ConfigureWindow — no WM needed — so it resizes
+    reliably. Position is already pinned at 0,0 by --window-position, so the
+    size is not clamped against a cascade offset.
+    """
+    try:
+        cdp = page.context.new_cdp_session(page)
+        win = cdp.send("Browser.getWindowForTarget")
+        cdp.send(
+            "Browser.setWindowBounds",
+            {
+                "windowId": win["windowId"],
+                "bounds": {
+                    "left": 0,
+                    "top": 0,
+                    "width": VIEWPORT_WIDTH,
+                    "height": VIEWPORT_HEIGHT,
+                    "windowState": "normal",
+                },
+            },
+        )
+        log.info(
+            "window bounds set via CDP: %dx%d at 0,0", VIEWPORT_WIDTH, VIEWPORT_HEIGHT
+        )
+        # Playwright pins the renderer to the initial (1280x800) window via
+        # device-metrics emulation; after the CDP resize the browser UI follows
+        # the new window but the page keeps the old viewport. Clearing the
+        # override lets the page reflow to the full window.
+        try:
+            cdp.send("Emulation.clearDeviceMetricsOverride")
+        except Exception as exc:
+            log.debug("clearDeviceMetricsOverride: %s", exc)
+    except Exception as exc:
+        log.warning("window maximize via CDP failed: %s", exc)
+
+
 def _launch_provider(
     playwright: Any,
     *,
@@ -551,6 +745,18 @@ def _launch_provider(
     schedule_id: int | None,
 ) -> ProviderContext:
     _ensure_timezone()
+
+    # Ждём X-сокет: entrypoint запускает Xvfb и сразу exec'ит python — chromium
+    # может стартовать раньше, чем Xvfb поднял сокет, и падать
+    # "headed browser without XServer". Ждём появления /tmp/.X11-unix/X<N>.
+    disp = os.environ.get("DISPLAY", ":99")
+    x_sock = f"/tmp/.X11-unix/X{disp.lstrip(':')}"
+    for _ in range(40):
+        if os.path.exists(x_sock):
+            break
+        time.sleep(0.5)
+    else:
+        log.warning("X socket %s not ready after 20s, continuing anyway", x_sock)
 
     chromium = playwright.chromium
     debug = provider_debug.config_from_env()
@@ -566,6 +772,13 @@ def _launch_provider(
     load_ext = external_url is None
     if load_ext:
         log.info("extension mode: unpacked --load-extension (%s)", ext_dir)
+        if _BROWSER_FLAVOR == "yandex":
+            log.warning(
+                "yandex flavor without an install policy: the Yandex builds strip "
+                "--load-extension, so the unpacked fallback CANNOT load the extension "
+                "here — the provider will run without it. Policy comes from the "
+                "entrypoint; do not set CEKI_EXT_SKIP_UPDATE / CEKI_WS_URL on yandex."
+            )
     else:
         log.info("extension mode: external update (%s)", external_url)
 
@@ -573,8 +786,17 @@ def _launch_provider(
         args = list(_CHROME_ARGS)
         if use_load_ext:
             args.extend(a.format(ext_dir=ext_dir) for a in _LOAD_EXT_ARGS)
-        # --window-size makes the window deterministic under Xvfb (no WM):
-        # without it the framebuffer size can drift from the requested viewport.
+        # Debug capture: CDP port on every launch (install + run) so both phases
+        # are inspectable; harmless in the install phase.
+        if debug:
+            args.extend(debug.chrome_args())
+        # Under Xvfb there is no window manager, so --start-maximized is a no-op
+        # and Chromium opens the window at its default cascade offset (~130,60):
+        # a grey strip of bare framebuffer shows on the top/left and the
+        # bottom-right is cut off the RTMP capture. CDP setWindowBounds fixes the
+        # size but a WM-less X server ignores its position, so pin the origin at
+        # launch too. Window outer size == the framebuffer → fills the screen.
+        args.append("--window-position=0,0")
         args.append(f"--window-size={VIEWPORT_WIDTH},{VIEWPORT_HEIGHT}")
         return args
 
@@ -582,7 +804,15 @@ def _launch_provider(
         return chromium.launch_persistent_context(
             profile_dir,
             headless=False,
+            # Yandex flavor: drive the Yandex Browser binary instead of
+            # Playwright's pinned Chromium. Same CDP surface (it is Chromium
+            # underneath); None keeps the default for the chromium image.
+            executable_path=_browser_binary(),
             args=build_chrome_args(use_load_ext),
+            # pseudo-yandex: launch-level UA (navigator.userAgent + HTTP header).
+            # Client Hints / userAgentData are layered on top per page via CDP
+            # (see _apply_ua_override_single) — launch() cannot set those.
+            user_agent=_PSEUDO_UA if _BROWSER_FLAVOR == "pseudo-yandex" else None,
             # Playwright injects a batch of --disable-* args by default, three of
             # which block the external-update policy install:
             #   --disable-extensions              — extensions off entirely
@@ -597,7 +827,12 @@ def _launch_provider(
                 "--disable-background-networking",
                 "--disable-default-apps",
             ],
-            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+            # viewport=None: do not force the page size (Playwright would grow
+            # the window to viewport+chrome-height, taller than the screen).
+            # The final geometry is enforced via CDP after launch (see
+            # _maximize_window): Playwright appends its own default
+            # --window-size=1280,800 after our args and that one wins.
+            viewport=None,
             ignore_https_errors=True,
         )
 
@@ -620,7 +855,14 @@ def _launch_provider(
         expected=expected_id,
         wait_s=90.0 if not load_ext else 45.0,
     )
+    # CRITICAL: Fully kill the browser process so the second launch starts fresh.
+    # c1.close() only closes the context; the browser process persists and
+    # the second launch_persistent_context() reuses it, creating a second
+    # window on the same X11 display. The first window (1280x800) then
+    # obscures the full-HD window in x11grab capture.
     c1.close()
+    # Give the browser process time to exit cleanly
+    time.sleep(2)
     if not ext_id and not load_ext:
         # The external policy existed but the extension did not materialise
         # (offline channel, unreachable CRX). Fall back to the unpacked copy.
@@ -662,7 +904,6 @@ def _launch_provider(
     # Debug capture: open the CDP port only on the final (run) launch — the
     # install phase above already closed its Chromium, so the port never races.
     if debug:
-        chrome_args.extend(debug.chrome_args())
         log.info("debug capture: chrome args extended with %s", debug.chrome_args())
 
     browser_context = launch(load_ext)
@@ -670,6 +911,13 @@ def _launch_provider(
     # Handle JavaScript dialogs (alert/confirm/prompt) to prevent unhandled
     # ProtocolError in Playwright's internal Node.js driver (crashes browser context).
     browser_context.on("dialog", lambda dialog: dialog.dismiss())
+
+    # pseudo-yandex: every page (now and in the future) gets the YaBrowser UA +
+    # Client Hints. The CDP override set on a page survives navigations of that
+    # page; pages opened later get patched on the "page" event.
+    if _BROWSER_FLAVOR == "pseudo-yandex":
+        browser_context.on("page", _apply_ua_override_to_page)
+        _apply_ua_override(browser_context)
 
     discovered = _discover_ext_id(browser_context, expected=expected_id, wait_s=60.0)
     if discovered:
@@ -738,6 +986,52 @@ def _launch_provider(
         dbg_stop = threading.Event()
         dbg_mgr = provider_debug.start_capture(debug, ext_id, dbg_stop)
         log.info("debug capture manager started" if dbg_mgr else "debug capture manager failed to start")
+
+    # Растягиваем окно на весь экран (Xvfb без WM — флаги не работают, только CDP).
+    _maximize_window(popup)
+
+    # --- Настройки плагина (seed в chrome.storage.local) ---
+    # Панель: тумблер "Открывать развёрнутым" (open_window_normal) и
+    # "Открывать в фокусе" (open_window_focused). ON = true в storage.
+    def _flag(name: str, default: bool) -> bool:
+        v = os.environ.get(name)
+        return default if v is None else v.lower() in ("1", "true", "yes", "on")
+
+    settings = {
+        "open_window_normal": _flag("CEKI_PROVIDER_OPEN_NORMAL", True),
+        "open_window_focused": _flag("CEKI_PROVIDER_OPEN_FOCUSED", True),
+        "restore_focus_on_rental": _flag("CEKI_PROVIDER_RESTORE_FOCUS_ON_RENTAL", False),
+    }
+    try:
+        res = popup.evaluate(
+            "(async (s) => { await chrome.storage.local.set(s); "
+            "const g = await chrome.storage.local.get(Object.keys(s)); return JSON.stringify(g); })",
+            settings,
+        )
+        log.info("plugin settings seeded: %s", res)
+    except Exception as exc:
+        log.warning("plugin settings seed failed: %s", exc)
+
+    # Открываем сайдбар плагина (боковую панель) в окне провайдера. Делаем это
+    # пока вкладка ещё extension-страница: из service worker sidePanel.open()
+    # требует user gesture и будет отклонён.
+    try:
+        res = popup.evaluate(
+            "(async () => { const w = await chrome.windows.getCurrent(); "
+            "if (!w || w.id === undefined) return 'ERR no-window'; "
+            "await chrome.sidePanel.open({ windowId: w.id }); return 'ok window=' + w.id; })()"
+        )
+        log.info("sidepanel open attempt: %s", res)
+    except Exception as exc:
+        log.warning("sidepanel open failed: %s", exc)
+
+    # Стартовая страница вместо UI расширения (idle-вид стрима).
+    idle_url = os.environ.get("CEKI_PROVIDER_IDLE_URL", "https://ceki.me")
+    try:
+        popup.goto(idle_url, wait_until="domcontentloaded", timeout=25_000)
+        log.info("idle page shown: %s", idle_url)
+    except Exception as exc:
+        log.warning("idle page nav failed: %s", exc)
 
     return ProviderContext(
         browser_context=browser_context,
