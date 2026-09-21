@@ -300,7 +300,7 @@ fi
 # host-display sockets / ffmpeg streaming the daemon does not implement).
 if [ "${CEKI_DAEMON:-0}" = "1" ]; then
   echo "[ceki-provider] run mode: daemon (ceki_browser_provider.daemon)"
-  exec python -m ceki_browser_provider.daemon
+  exec python -u -m ceki_browser_provider.daemon
 fi
 
 exec "$@"
