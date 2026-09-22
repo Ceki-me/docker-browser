@@ -832,7 +832,7 @@ def _launch_provider(
             # --window-size=1920x1080: трансляция видит узкую колонку.
             # Согласованно с --window-size и window-position=0,0 окно и
             # страница совпадают, полный экран, dpr=1.
-            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+            viewport={"width": 1600, "height": 1080},  # idle-страница: 1600x1080
             ignore_https_errors=True,
         )
 
