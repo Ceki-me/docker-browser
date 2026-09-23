@@ -519,9 +519,19 @@ class SpawnManager:
         base.mkdir(parents=True, exist_ok=True)
         dst = str(base / "_ext-patched")
         dst_p = Path(dst)
-        fresh = dst_p.joinpath("manifest.json").exists()
-        already = fresh and self._patch_stamp == self.cfg.local_ws_url
-        if not already:
+        # The patched copy is a SHARED singleton (one per daemon process), and
+        # _spawn_and_handshake runs OUTSIDE self._lock — N concurrent ensure()
+        # threads can reach here at once. An unlocked rmtree+copytree race
+        # tears the shared dir mid-copy: one Chrome loads a half-built
+        # extension, its service worker never comes up, and that rent's nav+ss
+        # fails (the B9 1-of-3 loss, ev 10077). Hold the lock across the whole
+        # rebuild so only one thread patches at a time and the others see the
+        # finished copy.
+        with self._lock:
+            fresh = dst_p.joinpath("manifest.json").exists()
+            already = fresh and self._patch_stamp == self.cfg.local_ws_url
+            if already:
+                return dst
             shutil.rmtree(dst, ignore_errors=True)
             shutil.copytree(src, dst)
             for f in dst_p.rglob("*.js"):
