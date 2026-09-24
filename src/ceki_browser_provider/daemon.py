@@ -604,6 +604,10 @@ class SpawnManager:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        try:
+            log.info("launch[%s]: chrome pid=%s pgid=%s display=:%d", inst.session_id, proc.pid, os.getpgid(proc.pid), inst.display)
+        except Exception:
+            pass
         return proc
 
     def _launch_xvfb(self, inst: Instance) -> subprocess.Popen:
@@ -644,6 +648,10 @@ class SpawnManager:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        try:
+            log.info("launch[%s]: xvfb pid=%s pgid=%s display=:%d", inst.session_id, proc.pid, os.getpgid(proc.pid), inst.display)
+        except Exception:
+            pass
         return proc
 
     def _spawn_and_handshake(self, inst: Instance, params: dict) -> None:
@@ -1025,6 +1033,7 @@ class SpawnManager:
             log.info("close_idle: closed %d background tab(s)", closed)
 
     def _kill_group(self, inst: Instance) -> None:
+        log.info("kill[%s]: chrome_pid=%s xvfb_pid=%s", inst.session_id, inst.chrome_pid, inst.xvfb_pid)
         for pid in (inst.chrome_pid, inst.xvfb_pid):
             if pid:
                 self._kill_proc_group(pid)
