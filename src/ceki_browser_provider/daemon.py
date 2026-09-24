@@ -475,17 +475,21 @@ class SpawnManager:
                 if inst is not None:
                     inst.ws = ws
                     inst.ready = True
+                    log.info("match_ws: by session_id %s -> inst %s", session_id, inst.session_id)
                     return inst
+                log.info("match_ws: session_id %s not in active instances (%s)", session_id, list(self._instances))
             for inst in self._instances.values():
                 if inst.ws is None or inst.ws.state == 3:  # CLOSED
                     inst.ws = ws
                     inst.ready = True
+                    log.info("match_ws: first-free bind -> inst %s (query sid=%s)", inst.session_id, session_id)
                     return inst
             # Overwrite: rebind the only instance (reconnect).
             if len(self._instances) == 1:
                 inst = next(iter(self._instances.values()))
                 inst.ws = ws
                 inst.ready = True
+                log.info("match_ws: overwrite-> inst %s (query sid=%s)", inst.session_id, session_id)
                 return inst
         return None
 
@@ -729,8 +733,10 @@ class SpawnManager:
                     continue
                 found = m.group(1)
                 if expected is None or found == expected:
+                    log.info("discover[%s]: found ext target url=%s", inst.session_id, url[:120])
                     return found
             time.sleep(0.5)
+        log.warning("discover[%s]: ext target not found after %.0fs (expected=%s)", inst.session_id, timeout, expected)
         return None
 
     def _handshake(self, inst: Instance) -> None:
@@ -756,7 +762,7 @@ class SpawnManager:
         if sw_ws is None:
             sw_ws = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
         if sw_ws is None:
-            log.warning("handshake: extension service worker target not found")
+            log.warning("handshake[%s]: extension service worker target not found", inst.session_id)
             return
 
         # Plugin UI toggles — mirror app.py (idle provider) so the rental
@@ -803,15 +809,15 @@ class SpawnManager:
         )
         try:
             result = self._cdp_eval(sw_ws, expr)
-            log.info("handshake: storage set -> %s", json.dumps(result)[:200])
+            log.info("handshake[%s]: storage set -> %s", inst.session_id, json.dumps(result)[:200])
         except Exception as exc:
-            log.warning("handshake failed: %s", exc)
+            log.warning("handshake[%s] failed: %s", inst.session_id, exc)
         self._retry_token_after_offscreen(inst, sw_ws, payload)
 
     def _retry_token_after_offscreen(
         self, inst: Instance, sw_ws: str, payload: dict
     ) -> None:
-        """Re-deliver the token once the offscreen document is up.
+        """Keep re-delivering the token until the presence-WS connects.
 
         The first ``storage.local.set`` fires ``storage.onChanged`` immediately,
         while the SW's ``offscreenPort`` may still be null (offscreen document
@@ -820,61 +826,81 @@ class SpawnManager:
         sees ``sanctum_token === _lastKnownToken`` and skips ``token_updated`` —
         so the offscreen never opens its presence-WS (QA repro, ev 8639).
 
-        Fix on the daemon side (no extension change): wait for the offscreen
-        page target, then clear the token and re-set it. The second
-        ``onChanged`` fires with the live port: ``token_cleared`` then
-        ``token_updated`` reach the offscreen, which connects to the local WS.
+        Fix on the daemon side (no extension change): clear the token and
+        re-set it *repeatedly* until the extension's presence-WS actually
+        connects. The second+ ``onChanged`` fires ``token_cleared`` then
+        ``token_updated`` into the live ``offscreenPort``. A SINGLE clear+set
+        is not enough under parallel spawn: the offscreen page target can be
+        visible over CDP while its module script (which registers the token
+        callback) has not run yet — a re-delivery in that window is lost the
+        same way as the first, and the instance stalls without a presence-WS
+        until the watchdog reaps it (B9 1-of-3 loss, ev 10077). Loop the
+        clear+set until the WS is up or a generous deadline (the watchdog's
+        connect timeout) expires.
         """
-        off_ws = None
+        deadline = time.time() + int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90"))
+        # The offscreen may not exist yet (document not created). Wait for the
+        # CDP page target first so a clear+set has a live offscreen to receive
+        # the re-delivery.
         for _ in range(60):  # up to ~30s for offscreen to appear
-            off_ws = self._find_offscreen_target(inst)
-            if off_ws is not None:
+            if self._find_offscreen_target(inst) is not None:
                 break
             time.sleep(0.5)
-        if off_ws is None:
-            log.warning("handshake: offscreen target never appeared, token may be lost")
-            return
+        else:
+            log.warning("handshake[%s]: offscreen target never appeared, token may be lost", inst.session_id)
 
-        # Give the offscreen a moment to deliver the first token set into its
-        # presence-WS. If the extension already connected, the handshake
-        # succeeded — do NOT clear the token. The offscreen treats token=null
-        # as an intentional close (offscreen.ts onTokenFromSw), and the local
-        # WS handler would then misread that disconnect as a crash and destroy
-        # the instance mid-spawn (the parallel-rent crash, ev 9095: 2nd/3rd
-        # session destroyed (crashed) right after extension connected, token
-        # re-set failed with Connect call failed on the port).
-        for _ in range(6):  # up to ~3s for the WS to come up
+        round_no = 0
+        while time.time() < deadline:
+            round_no += 1
             ws = inst.ws
             if ws is not None and getattr(ws, "state", 3) == 1:
                 log.info(
-                    "handshake: presence-WS already connected, token delivered — skipping re-delivery"
+                    "handshake[%s]: presence-WS connected (round %d)",
+                    inst.session_id, round_no,
                 )
                 return
-            time.sleep(0.5)
+            # Re-resolve the SW target: CDP evals can outlive the SW (it may
+            # have been torn down under load) — a stale ws_url just errors.
+            cur_sw = sw_ws
+            if round_no > 1:
+                found = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
+                if found is None:
+                    found = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
+                if found is not None:
+                    cur_sw = found
+            # Clear then re-set: onChanged fires token_cleared then
+            # token_updated, now delivering into the live offscreenPort.
+            clear_ok = False
+            try:
+                self._cdp_eval(cur_sw, "chrome.storage.local.remove('sanctum_token', () => true)")
+                clear_ok = True
+            except Exception as exc:
+                log.warning("handshake[%s]: token clear failed: %s", inst.session_id, exc)
+            time.sleep(0.5)  # let the onChanged debounce (50ms + tick) process
+            try:
+                if clear_ok:
+                    result = self._cdp_eval(
+                        cur_sw,
+                        "chrome.storage.local.set(" + json.dumps(payload) + ", () => true)",
+                    )
+                    log.info(
+                        "handshake[%s]: token re-set (round %d) -> %s",
+                        inst.session_id, round_no, json.dumps(result)[:120],
+                    )
+            except Exception as exc:
+                log.warning("handshake[%s]: token re-set failed: %s", inst.session_id, exc)
 
-        # Re-check right before the destructive clear: if the extension
-        # connected during the window above (token was delivered), skip.
-        ws = inst.ws
-        if ws is not None and getattr(ws, "state", 3) == 1:
-            log.info("handshake: presence-WS connected during wait, skipping re-delivery")
-            return
-
-        # Clear then re-set: onChanged fires token_cleared then token_updated,
-        # now delivering into the live offscreenPort.
-        try:
-            self._cdp_eval(sw_ws, "chrome.storage.local.remove('sanctum_token', () => true)")
-            log.info("handshake: token cleared for re-delivery")
-        except Exception as exc:
-            log.warning("handshake: token clear failed: %s", exc)
-        time.sleep(0.7)  # let the onChanged debounce (50ms + tick) process
-        try:
-            self._cdp_eval(
-                sw_ws,
-                "chrome.storage.local.set(" + json.dumps(payload) + ", () => true)",
-            )
-            log.info("handshake: token re-set after offscreen ready")
-        except Exception as exc:
-            log.warning("handshake: token re-set failed: %s", exc)
+            # Give the WS a moment to come up before the next round.
+            for _ in range(10):  # ~5s
+                ws = inst.ws
+                if ws is not None and getattr(ws, "state", 3) == 1:
+                    log.info("handshake[%s]: presence-WS connected after re-delivery (round %d)", inst.session_id, round_no)
+                    return
+                time.sleep(0.5)
+        log.warning(
+            "handshake[%s]: presence-WS never came up within %.0fs (re-delivery exhausted)",
+            inst.session_id, deadline - time.time() + int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90")),
+        )
 
     def _find_target_ws(self, inst: Instance, kind: str, ext_id: str) -> str | None:
         """Return the webSocketDebuggerUrl of the first target of ``kind`` whose
@@ -954,6 +980,7 @@ class SpawnManager:
         if inst.ws is not None or (inst.session_id and self.active().get(inst.session_id) is inst):
             log.info("close_idle: skip (session already active for %s)", inst.session_id)
             return
+        log.info("close_idle: running for session %s", inst.session_id)
         cdp = f"http://127.0.0.1:{inst.cdp_port}"
         garbage_prefixes = (
             "chrome://wallpaper",
@@ -1341,10 +1368,10 @@ class LocalWsServer:
                 break
         inst = self.spawner.match_ws(ws, session_id)
         if inst is None:
-            log.warning("local-ws: no free instance to bind, closing connection")
+            log.warning("local-ws: no free instance to bind (query sid=%s), closing connection", session_id)
             await ws.close()
             return
-        log.info("local-ws: extension connected for session %s", inst.session_id)
+        log.info("local-ws: extension connected for session %s (query sid=%s)", inst.session_id, session_id)
         # Flush any relay messages buffered while the instance was spawning.
         # CRITICAL ordering: the extension only creates the rental window when
         # it has a `match` (sets _pendingSession). A CDP/navigate that arrives
