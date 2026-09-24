@@ -1127,6 +1127,7 @@ class ProviderWsClient:
         self.ws: Any = None
         self._stop = False
         self._reconnect_delay = 1.0
+        self._started_at = time.time()
 
     @property
     def relay_url(self) -> str:
