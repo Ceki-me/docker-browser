@@ -341,6 +341,7 @@ class SpawnManager:
         self._queued: dict[str, list[dict]] = {}
         self._patch_stamp: str | None = None
         self._swept = False
+        self._boot_slot = 0
 
     # -- public API (spec-shaped) ----------------------------------------------
 
@@ -377,7 +378,22 @@ class SpawnManager:
                 profile_mode=params.get("profile_mode"),
             )
             self._instances[session_id] = inst
+            # Stage-4 boot stagger (ev 10077): N parallel ensure() calls each
+            # launch a full Xvfb + two-launch Chromium (~1GB transient each).
+            # Starting all N at the same instant spikes host RAM/CPU/SHM and
+            # reliably wedges one of the Chromes (its extension never reaches
+            # the presence-WS, watchdog reaps it → B9 1-of-3 loss even with the
+            # ext-dir and re-delivery fixes). Slot the spawns ~2s apart: still
+            # race-free (every session gets handshake+CDP), but the boot burst
+            # is spread so the host stays responsive.
+            self._boot_slot += 1
+            boot_no = self._boot_slot
 
+        stagger = int(os.environ.get("CEKI_DAEMON_BOOT_STAGGER_S", "2"))
+        if self.cfg.max_sessions > 1 and boot_no > 1 and stagger > 0:
+            delay = (boot_no - 1) * stagger
+            log.info("ensure[%s]: boot stagger %ds (slot %d)", session_id, delay, boot_no)
+            time.sleep(delay)
         try:
             self._spawn_and_handshake(inst, params)
         except Exception as exc:
