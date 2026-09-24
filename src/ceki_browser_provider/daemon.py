@@ -759,6 +759,15 @@ class SpawnManager:
             log.warning("handshake: extension service worker target not found")
             return
 
+        # Plugin UI toggles — mirror app.py (idle provider) so the rental
+        # window opens 'normal' + focused on the daemon's display too. Without
+        # these the extension falls back to its own defaults (ports.ts):
+        # open_window_normal undefined -> minimized, which leaves the rental
+        # content off the streamed X window (empty NTP on X151).
+        def _flag(name: str, default: bool) -> bool:
+            v = os.environ.get(name)
+            return default if v is None else v.lower() in ("1", "true", "yes", "on")
+
         payload = {
             "sanctum_token": self.cfg.token,
             "ceki_browser": {
@@ -770,6 +779,11 @@ class SpawnManager:
             "paired_at": int(time.time() * 1000),
             "incognito_available": True,
             "auto_accept": True,
+            # Same plugin toggles app.py (idle) seeds — keep the rental window
+            # visible on the streamed display in daemon mode.
+            "open_window_normal": _flag("CEKI_PROVIDER_OPEN_NORMAL", True),
+            "open_window_focused": _flag("CEKI_PROVIDER_OPEN_FOCUSED", True),
+            "restore_focus_on_rental": _flag("CEKI_PROVIDER_RESTORE_FOCUS_ON_RENTAL", False),
         }
         # Local relay endpoint override (ev 9362). Some branded builds (Yandex
         # corporate) do NOT surface config-dir managed policy into
