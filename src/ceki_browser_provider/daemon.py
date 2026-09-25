@@ -794,9 +794,22 @@ class SpawnManager:
         # these the extension falls back to its own defaults (ports.ts):
         # open_window_normal undefined -> minimized, which leaves the rental
         # content off the streamed X window (empty NTP on X151).
+        #
+        # IMPORTANT: env flags (CEKI_PROVIDER_OPEN_*) only define the INITIAL
+        # state. After first seed chrome.storage.local belongs to the user —
+        # the plugin panel is the only writer. Writing these unconditionally
+        # on every handshake/re-delivery silently reverts the user's toggles
+        # (rental windows pop to normal+focused even when the user chose
+        # minimized). So seed them only while they are still undefined.
         def _flag(name: str, default: bool) -> bool:
             v = os.environ.get(name)
             return default if v is None else v.lower() in ("1", "true", "yes", "on")
+
+        ui_seed = {
+            "open_window_normal": _flag("CEKI_PROVIDER_OPEN_NORMAL", True),
+            "open_window_focused": _flag("CEKI_PROVIDER_OPEN_FOCUSED", True),
+            "restore_focus_on_rental": _flag("CEKI_PROVIDER_RESTORE_FOCUS_ON_RENTAL", False),
+        }
 
         payload = {
             "sanctum_token": self.cfg.token,
@@ -809,11 +822,6 @@ class SpawnManager:
             "paired_at": int(time.time() * 1000),
             "incognito_available": True,
             "auto_accept": True,
-            # Same plugin toggles app.py (idle) seeds — keep the rental window
-            # visible on the streamed display in daemon mode.
-            "open_window_normal": _flag("CEKI_PROVIDER_OPEN_NORMAL", True),
-            "open_window_focused": _flag("CEKI_PROVIDER_OPEN_FOCUSED", True),
-            "restore_focus_on_rental": _flag("CEKI_PROVIDER_RESTORE_FOCUS_ON_RENTAL", False),
         }
         # Local relay endpoint override (ev 9362). Some branded builds (Yandex
         # corporate) do NOT surface config-dir managed policy into
@@ -826,10 +834,24 @@ class SpawnManager:
         payload["ceki_runtime_config"] = {
             "relay_ws": self.cfg.local_ws_url,
         }
+        # One round-trip: unconditionally write the service keys, but only
+        # seed the user-owned UI toggles that are still undefined. The JS
+        # reads the current storage in-process, so there is no daemon-side
+        # race with the panel writing at the same moment.
+        ui_seed_json = json.dumps(ui_seed)
         expr = (
-            "chrome.storage.local.set("
-            + json.dumps(payload)
-            + ", () => true)"
+            "(async () => {"
+            "const keys = Object.keys(" + ui_seed_json + ");"
+            "const current = await chrome.storage.local.get(keys);"
+            "const seed = {};"
+            "for (const k of keys) {"
+            "  if (current[k] === undefined) seed[k] = " + ui_seed_json + "[k];"
+            "}"
+            "await chrome.storage.local.set(" + json.dumps(payload) + ");"
+            "const seeded = Object.keys(seed);"
+            "if (seeded.length) await chrome.storage.local.set(seed);"
+            "return JSON.stringify({ seeded });"
+            "})()"
         )
         try:
             result = self._cdp_eval(sw_ws, expr)
