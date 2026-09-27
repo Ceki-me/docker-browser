@@ -827,12 +827,11 @@ def _launch_provider(
                 "--disable-background-networking",
                 "--disable-default-apps",
             ],
-# viewport=None: do not force the page size (Playwright would grow
-            # the window to viewport+chrome-height, taller than the screen).
-            # The final geometry is enforced via CDP after launch (see
-            # _maximize_window): Playwright appends its own default
-            # --window-size=1280,800 after our args and that one wins.
-            viewport=None,
+# viewport явно = 1600x1080 (laptop-like), как подобрали при фиксе 9eeb51d:
+            # иначе Playwright без viewport пинет страницу на 1280x720
+            # (эмуляция device-metrics), хотя окно --window-size=1920x1080 —
+            # трансляция видит узкую колонку. 1600x1080 = laptop-like на FullHD.
+            viewport={"width": 1600, "height": 1080},  # idle-страница: 1600x1080
             ignore_https_errors=True,
         )
 
