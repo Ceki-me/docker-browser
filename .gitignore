@@ -9,8 +9,15 @@ build/
 dist/
 .venv/
 
-# Local dev-only compose + overlay files (contain dev URLs/tokens — untracked on purpose).
+# Local dev/prod-only compose + overlay files (contain dev/prod URLs/tokens —
+# untracked on purpose; never commit). Grouped by prefix so future files match.
 docker-compose.dev*.yml
+docker-compose.prod*.yml
+Dockerfile.dev*.yml
+Dockerfile.dev*
+Dockerfile.yandex-c266
+*.env
+.env*
 Dockerfile.dev-daemon-overlay
 
 # Local persist-profile bind dir (real Chrome profiles, never commit).
