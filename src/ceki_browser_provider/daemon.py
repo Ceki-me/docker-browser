@@ -796,11 +796,24 @@ class SpawnManager:
         # content off the streamed X window (empty NTP on X151).
         #
         # IMPORTANT: env flags (CEKI_PROVIDER_OPEN_*) only define the INITIAL
-        # state. After first seed chrome.storage.local belongs to the user —
-        # the plugin panel is the only writer. Writing these unconditionally
-        # on every handshake/re-delivery silently reverts the user's toggles
-        # (rental windows pop to normal+focused even when the user chose
-        # minimized). So seed them only while they are still undefined.
+        # state, and who owns that state depends on the profile mode:
+        #
+        #   * main  — the host's REAL profile. chrome.storage.local belongs to
+        #     the user, the plugin panel is the only writer. Writing the toggles
+        #     unconditionally on every handshake/re-delivery silently reverts
+        #     the user's choices (rental windows pop to normal+focused even when
+        #     the host chose minimized). Seed only while still undefined.
+        #
+        #   * incognito / unset — the daemon's OWN throwaway profile, recreated
+        #     per rent under /sessions and deleted afterwards. There is no user
+        #     to preserve, but the extension seeds `open_window_normal: false`
+        #     itself on first install (background.ts onInstalled), so by the
+        #     time we write, the key is never undefined — the env-driven value
+        #     was therefore never applied, the rental window opened
+        #     `focused: false` / `state: 'minimized'` (ports.ts), and on an Xvfb
+        #     display with no window manager the window never painted: the
+        #     stream saw an empty "New Tab" window and stayed on idle. Seed the
+        #     toggles unconditionally for these profiles.
         def _flag(name: str, default: bool) -> bool:
             v = os.environ.get(name)
             return default if v is None else v.lower() in ("1", "true", "yes", "on")
@@ -834,18 +847,28 @@ class SpawnManager:
         payload["ceki_runtime_config"] = {
             "relay_ws": self.cfg.local_ws_url,
         }
-        # One round-trip: unconditionally write the service keys, but only
-        # seed the user-owned UI toggles that are still undefined. The JS
-        # reads the current storage in-process, so there is no daemon-side
-        # race with the panel writing at the same moment.
+        # One round-trip: unconditionally write the service keys, then seed the
+        # UI toggles — unconditionally for the daemon's own (non-main) profiles,
+        # only-when-undefined for the host's real profile. The JS reads the
+        # current storage in-process, so there is no daemon-side race with the
+        # panel writing at the same moment.
+        # Seed policy: the DAEMON'S OWN (non-main) profiles are throwaway —
+        # recreated per rent /sessions and deleted after — nothing user-owned
+        # survives between rentals, so the toggles are seeded unconditionally
+        # (persist is always off and not planned). The host's real 'main'
+        # profile keeps the undefined-only guard: its storage is the user's and
+        # an unconditional overwrite would silently revert their panel choices.
+        seed_only_undefined = inst.profile_mode == "main"
         ui_seed_json = json.dumps(ui_seed)
+        # host profile → keep the user's value; daemon's own profile → overwrite.
+        guard = "current[k] === undefined" if seed_only_undefined else "true"
         expr = (
             "(async () => {"
             "const keys = Object.keys(" + ui_seed_json + ");"
             "const current = await chrome.storage.local.get(keys);"
             "const seed = {};"
             "for (const k of keys) {"
-            "  if (current[k] === undefined) seed[k] = " + ui_seed_json + "[k];"
+            "  if (" + guard + ") seed[k] = " + ui_seed_json + "[k];"
             "}"
             "await chrome.storage.local.set(" + json.dumps(payload) + ");"
             "const seeded = Object.keys(seed);"
