@@ -1508,11 +1508,43 @@ class LocalWsServer:
             pass
         finally:
             log.info("local-ws: extension disconnected (session %s)", inst.session_id)
-            # If the extension dropped without session_end (crash / hard kill of
-            # the Chrome), tear the instance down. A reconnect replaces inst.ws
-            # with the new socket, so this must only fire when we still own it.
+            # Distinguish a REAL crash from a transient WS drop. A hard Chrome
+            # kill / OOM leaves the process dead -- reap it right away (the
+            # extension never sends session_ended then). But the extension can
+            # also drop its local WS for benign reasons (offscreen restart,
+            # service-worker teardown, relay reconnect, handshake's own
+            # clear/set re-delivery): the Chrome process is still alive and the
+            # rent must NOT be killed -- merely unbind the closed socket and let
+            # match_ws (first-free bind) plus the _handshake presence-WS loop
+            # re-establish it. Real death is later double-checked by the
+            # watchdog (chrome died -> reap), so a missed kill here leaks
+            # nothing. This fixes the flapping "extension connected &
+            # disconnected in the same second -> destroyed (crashed)" pattern
+            # (rent 12324: token re-set failed on port 9225 because the reader
+            # thread killed Chrome before the handshake thread finished).
+            # Safety: only fire when we still own this exact socket -- a
+            # reconnect replaces inst.ws with the new one inside the lock.
             if self.spawner.active().get(inst.session_id) is inst and inst.ws is ws:
-                await asyncio.to_thread(self.spawner.destroy, inst.session_id, "crashed")
+                chrome_alive = _pid_alive(inst.chrome_pid) if inst.chrome_pid else False
+                if not chrome_alive:
+                    log.info(
+                        "local-ws[%s]: chrome dead (pid=%s) -- destroy(crashed)",
+                        inst.session_id, inst.chrome_pid,
+                    )
+                    await asyncio.to_thread(self.spawner.destroy, inst.session_id, "crashed")
+                else:
+                    log.info(
+                        "local-ws[%s]: WS dropped but chrome alive (pid=%s) -- "
+                        "unbind, awaiting reconnect",
+                        inst.session_id, inst.chrome_pid,
+                    )
+                    inst.ws = None
+                    # Give the rent a grace window: keep Chrome alive and let
+                    # match_ws re-bind (it re-sets ready on the new socket).
+                    # Drop ready so the watchdog can still reap the slot if
+                    # the extension never comes back (ws=None + ready=True
+                    # would leak it forever).
+                    inst.ready = False
 
 
 class Daemon:
