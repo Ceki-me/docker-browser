@@ -993,12 +993,16 @@ def _launch_provider(
     # Панель: тумблер "Открывать развёрнутым" (open_window_normal) и
     # "Открывать в фокусе" (open_window_focused). ON = true в storage.
     #
-    # IMPORTANT: env flags (CEKI_PROVIDER_OPEN_*) only define the INITIAL
-    # state. After first seed chrome.storage.local belongs to the user —
-    # the plugin panel is the only writer. Writing these unconditionally on
-    # every provider start silently reverts the user's toggles (rental
-    # windows pop to normal+focused even when the user chose minimized).
-    # So seed them only while they are still undefined.
+    # Сеем БЕЗУСЛОВНО: этот лаунчер работает на собственном одноразовом
+    # профиле (tempfile.mkdtemp, удаляется на выходе), пользовательских
+    # тумблеров, которые стоило бы щадить, тут нет. Гард "только если
+    # undefined" ломался о то, что расширение само ставит
+    # open_window_normal: false при первой установке (background.ts
+    # onInstalled): ключ никогда не undefined, поэтому env CEKI_PROVIDER_OPEN_*
+    # не применялся вовсе — окно аренды открывалось focused: false /
+    # state: 'minimized' (ports.ts), а на Xvfb без оконного менеджера не
+    # рисовалось совсем. Для профиля ХОСТА (main) такой гард по-прежнему
+    # нужен — он живёт в daemon.py, где профили разделены по profile_mode.
     def _flag(name: str, default: bool) -> bool:
         v = os.environ.get(name)
         return default if v is None else v.lower() in ("1", "true", "yes", "on")
@@ -1011,12 +1015,9 @@ def _launch_provider(
     try:
         res = popup.evaluate(
             "(async (s) => { "
-            "const cur = await chrome.storage.local.get(Object.keys(s)); "
-            "const seed = {}; "
-            "for (const k of Object.keys(s)) { if (cur[k] === undefined) seed[k] = s[k]; } "
-            "const seeded = Object.keys(seed); "
-            "if (seeded.length) await chrome.storage.local.set(seed); "
-            "return JSON.stringify({ seeded }); "
+            "await chrome.storage.local.set(s); "
+            "const after = await chrome.storage.local.get(Object.keys(s)); "
+            "return JSON.stringify({ ui_seed: after }); "
             "})",
             settings,
         )
