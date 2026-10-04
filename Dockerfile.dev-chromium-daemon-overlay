@@ -1,0 +1,17 @@
+# Local dev overlay: add the SDK provider daemon + updated entrypoint on top
+# of the stock chromium image (ceki/provider:latest). NOT committed (dev-only;
+# pattern mirrors Dockerfile.dev-daemon-overlay used for the yandex image).
+
+FROM ceki/provider:latest
+
+# Overlay the provider module (daemon.py) and the entrypoint (daemon run-mode
+# switch). extension/ is re-staged too so the fresh dist (MV3 configReady +
+# sidePanel guards) is present.
+COPY src/ /opt/ceki/src/
+COPY entrypoint.sh /usr/local/bin/ceki-entrypoint
+COPY extension/ /opt/ceki/extension/
+RUN chmod +x /usr/local/bin/ceki-entrypoint \
+ && python -m compileall -q /opt/ceki/src/ceki_browser_provider \
+ && python -c "import ceki_browser_provider.daemon; print('daemon import OK')"
+
+LABEL ceki.local=chromium-daemon-overlay

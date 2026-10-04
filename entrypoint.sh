@@ -38,6 +38,12 @@ DEFAULT_API_URL="https://api.ceki.me"
 # external-update policy file Chrome reads at start.
 EXT_ID="gfionhbdkojjnjpbhlblopoaecdpllhb"
 
+# Download temp dir for Browser.setDownloadBehavior (both chromium and
+# yandex images). The extension points its per-session downloads here; Chrome
+# /Yandex silently refuse to start a download if the target directory does
+# not exist, so create it once at container start.
+mkdir -p /tmp/ceki-dl && chmod 1777 /tmp/ceki-dl
+
 # --- External-extension policy -------------------------------------------------
 # Chrome installs and auto-updates the extension itself from an update channel
 # when a policy file /usr/share/chromium/extensions/<id>.json exists. This is

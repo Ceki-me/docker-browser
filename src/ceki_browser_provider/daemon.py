@@ -63,6 +63,7 @@ import httpx
 import websockets
 
 from ceki_browser_provider import app as provider_app
+from ceki_browser_provider import provider_debug
 
 log = logging.getLogger("ceki.provider.daemon")
 
@@ -342,6 +343,8 @@ class SpawnManager:
         self._patch_stamp: str | None = None
         self._swept = False
         self._boot_slot = 0
+        self._captures: list[Any] = []
+        self._captures_stop: list[threading.Event] = []
 
     # -- public API (spec-shaped) ----------------------------------------------
 
@@ -407,6 +410,13 @@ class SpawnManager:
             inst = self._instances.pop(session_id, None)
         if inst is None:
             return
+        # Stop any debug-capture manager bound to this instance's CDP port.
+        stops = getattr(self, "_captures_stop", [])
+        if stops:
+            for s in stops:
+                s.set()
+            self._captures_stop = []
+            self._captures = []
         self._kill_group(inst)
         # Return CDP/display slots to the pool so a later ensure() can reuse
         # them (sequential rent cycle: session_end -> next match spawns again).
@@ -627,6 +637,24 @@ class SpawnManager:
         return proc
 
     def _launch_xvfb(self, inst: Instance) -> subprocess.Popen:
+        # Adoption path (host-provided Xvfb): if an X server already answers
+        # :<display>, use it instead of spawning our own. A self-spawned Xvfb
+        # puts its socket in a container-private tmpfs the stream sidecar can
+        # never reach, making rentals invisible (the core bug we fixed by
+        # pointing containers at the host /tmp/.X11-unix). Adopt the existing
+        # live display: return a handle carrying its real pid so destroy() can
+        # still kill the right process and no signalfig occurs.
+        probe = subprocess.run(
+            ["timeout", "3", "xwininfo", "-display", f":{inst.display}", "-root"],
+            capture_output=True,
+        )
+        if probe.returncode == 0:
+            ext = _procs_with_display(inst.display)
+            pid = ext[0][0] if ext else -1
+            log.info("xvfb: adopting host Xvfb on :%d (pid %s)", inst.display, pid)
+            env = dict(os.environ)
+            return _Popen_handle(pid=pid)
+
         # A previous run may have left an orphaned Xvfb on this display (its
         # socket was unlinked but the process survived a hard kill). That
         # stale process owns the display number and blocks a fresh Xvfb from
@@ -669,6 +697,29 @@ class SpawnManager:
         except Exception:
             pass
         return proc
+
+    def _maybe_start_debug_capture(self, inst: Instance) -> None:
+        """Start extension SW-console capture on this instance's CDP port when
+        CEKI_PROVIDER_DEBUG_LOG is set. Unlike app mode, the browser already
+        listens on inst.cdp_port (no separate 9333 browser), so we feed the
+        capture manager that port. Pure opt-in; no-op otherwise."""
+        cfg = provider_debug.config_from_env()
+        if cfg is None:
+            return
+        self._captures = getattr(self, "_captures", [])
+        self._captures_stop = getattr(self, "_captures_stop", [])
+        stop = threading.Event()
+        mgr = provider_debug.start_capture(
+            provider_debug.DebugConfig(log_path=cfg.log_path, port=inst.cdp_port,
+                                       ping_interval=cfg.ping_interval,
+                                       ping_timeout=cfg.ping_timeout),
+            _DEFAULT_EXT_ID,
+            stop,
+        )
+        if mgr is not None:
+            self._captures.append(mgr)
+            self._captures_stop.append(stop)
+            log.info("debug capture started for instance %s on cdp port %s", inst.session_id, inst.cdp_port)
 
     def _spawn_and_handshake(self, inst: Instance, params: dict) -> None:
         """Blocking spawn: Xvfb + Chrome (two-launch incognito) + token handshake.
@@ -729,6 +780,24 @@ class SpawnManager:
         self._discover_ext_id(inst, timeout=30)
         # 5) token handshake via the extension panel over CDP.
         self._handshake(inst)
+        # 5a) optional SW-console capture on this instance's CDP port.
+        self._maybe_start_debug_capture(inst)
+        # 5b) Re-spawn guard: if the extension never connected its presence-WS
+        # (handshake failed on a CDP 500 / dead target / stale browser on this
+        # port), give ONE fresh relaunch of the run-phase Chrome before the
+        # watchdog reaps the session. Cheap, bounded, and it turns the
+        # intermittent Yandex CDP WS 500 (which currently kills ~1/3 rents)
+        # into a recoverable second attempt.
+        ws = getattr(inst, "ws", None)
+        ws_open = ws is not None and getattr(ws, "state", None) == 1
+        if not ws_open:
+            log.warning("handshake: presence-WS not connected after handshake, relaunching run-phase Chrome once")
+            self._kill_proc_group(proc2.pid)
+            self._wait_exit(proc2.pid)
+            proc2 = self._launch_chrome(inst, chrome_args)
+            inst.chrome_pid = proc2.pid
+            self._discover_ext_id(inst, timeout=30)
+            self._handshake(inst)
         # 6) opportunistic: drop Yandex's default background tabs (ya.ru,
         #    chrome://wallpaper, alissenger) that eat ~1GB on an idle rent.
         #    Deferred so the extension's session tab (about:blank) opens first;
@@ -876,11 +945,31 @@ class SpawnManager:
             "return JSON.stringify({ seeded });"
             "})()"
         )
-        try:
-            result = self._cdp_eval(sw_ws, expr)
-            log.info("handshake[%s]: storage set -> %s", inst.session_id, json.dumps(result)[:200])
-        except Exception as exc:
-            log.warning("handshake[%s] failed: %s", inst.session_id, exc)
+# Retry the storage write a few times against a FRESH target ws. On
+        # Yandex corporate, a CDP WS-upgrade can intermittently answer
+        # HTTP 500 (stale/racing target); re-listing /json/list usually yields
+        # a working websocketDebuggerUrl. Doing this here (not inside
+        # _cdp_eval) keeps every other CDP eval predictable.
+        max_sets = 4
+        for attempt in range(max_sets):
+            try:
+                result = self._cdp_eval(sw_ws, expr)
+                log.info("handshake: storage set -> %s", json.dumps(result)[:200])
+                break
+            except Exception as exc:
+                log.warning(
+                    "handshake: storage.set attempt %d/%d failed on %s: %r",
+                    attempt + 1, max_sets, sw_ws, exc,
+                )
+                # Re-resolve the SW target — the previous ws may be dead
+                # (HTTP 500) and the extension may have re-registered it.
+                refreshed = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
+                if refreshed is None:
+                    refreshed = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
+                if refreshed and refreshed != sw_ws:
+                    log.info("handshake: SW target changed %s -> %s", sw_ws, refreshed)
+                    sw_ws = refreshed
+                time.sleep(1.0)
         self._retry_token_after_offscreen(inst, sw_ws, payload)
 
     def _retry_token_after_offscreen(
@@ -1005,24 +1094,32 @@ class SpawnManager:
     def _cdp_eval(self, ws_url: str, expression: str, timeout: float = 20.0) -> Any:
         """Evaluate ``expression`` in a CDP target via its webSocketDebuggerUrl."""
         async def _run() -> Any:
-            async with websockets.connect(ws_url, max_size=64 * 1024 * 1024) as sock:
-                request_id = 1
-                await sock.send(json.dumps({
-                    "id": request_id,
-                    "method": "Runtime.evaluate",
-                    "params": {
-                        "expression": expression,
-                        "awaitPromise": True,
-                        "returnByValue": True,
-                    },
-                }))
-                while True:
-                    msg = json.loads(await asyncio.wait_for(sock.recv(), timeout=timeout))
-                    if msg.get("id") == request_id:
-                        if "error" in msg:
-                            raise RuntimeError(f"CDP error: {msg['error']}")
-                        res = msg.get("result", {}).get("result", {})
-                        return res.get("value")
+            # websockets 13.x: ``connect()`` returns an async-CM (opens on enter).
+            # Keep the open-phase exception visible with the target URL so a
+            # branded-yandex CDP rejection (HTTP 40x/500 on WS-upgrade) is
+            # distinguishable from a transport failure in the daemon log.
+            try:
+                async with websockets.connect(ws_url, max_size=64 * 1024 * 1024) as sock:
+                    request_id = 1
+                    await sock.send(json.dumps({
+                        "id": request_id,
+                        "method": "Runtime.evaluate",
+                        "params": {
+                            "expression": expression,
+                            "awaitPromise": True,
+                            "returnByValue": True,
+                        },
+                    }))
+                    while True:
+                        msg = json.loads(await asyncio.wait_for(sock.recv(), timeout=timeout))
+                        if msg.get("id") == request_id:
+                            if "error" in msg:
+                                raise RuntimeError(f"CDP error: {msg['error']}")
+                            res = msg.get("result", {}).get("result", {})
+                            return res.get("value")
+            except Exception as exc:
+                log.warning("cdp: CDP eval failed ws=%s : %r", ws_url, exc)
+                raise
         return asyncio.run(_run())
 
     def _close_idle_tabs(self, inst: Instance) -> None:
@@ -1523,6 +1620,7 @@ class Daemon:
         self.relay = ProviderWsClient(cfg, self.spawner, self.router)
         self.local = LocalWsServer(cfg, self.spawner, self.relay)
         self._stop_event = threading.Event()
+        self._captures: list[Any] = []
         self._server = None
 
     async def _run(self) -> None:
