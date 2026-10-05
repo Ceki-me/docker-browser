@@ -858,7 +858,14 @@ class SpawnManager:
         # (persist is always off and not planned). The host's real 'main'
         # profile keeps the undefined-only guard: its storage is the user's and
         # an unconditional overwrite would silently revert their panel choices.
-        seed_only_undefined = inst.profile_mode == "main"
+        # Daemon-mode rents use a THROWAWAY profile under /sessions (persist
+        # is always off for the streamer container), so there is no user-owned
+        # storage to preserve — seed the toggles unconditionally even when
+        # profile_mode reports "main" (the relay labels our rents main, but
+        # the profile is still a fresh disposable one). Only a real persistent
+        # host profile (which this daemon mode never uses) would keep the
+        # undefined-only guard.
+        seed_only_undefined = self.cfg.persist and inst.profile_mode == "main"
         ui_seed_json = json.dumps(ui_seed)
         # host profile → keep the user's value; daemon's own profile → overwrite.
         guard = "current[k] === undefined" if seed_only_undefined else "true"
@@ -876,11 +883,28 @@ class SpawnManager:
             "return JSON.stringify({ seeded });"
             "})()"
         )
-        try:
-            result = self._cdp_eval(sw_ws, expr)
-            log.info("handshake[%s]: storage set -> %s", inst.session_id, json.dumps(result)[:200])
-        except Exception as exc:
-            log.warning("handshake[%s] failed: %s", inst.session_id, exc)
+        # Write with retry against a FRESH SW target: the first Runtime.evaluate
+        # on a just-started SW can race its WS-upgrade (HTTP 500) and silently
+        # lose the env-driven UI toggles (open_window_normal etc.) — the rental
+        # window then opens unfocused/minimized and never surfaces above the
+        # startup New Tab on the stream. Retrying a handful of times against a
+        # re-listed target makes the seed reliable.
+        max_sets = 4
+        for attempt in range(max_sets):
+            try:
+                result = self._cdp_eval(sw_ws, expr)
+                log.info("handshake[%s]: storage set -> %s", inst.session_id, json.dumps(result)[:200])
+                break
+            except Exception as exc:
+                log.warning(
+                    "handshake[%s]: storage.set attempt %d/%d failed on %s: %r",
+                    inst.session_id, attempt + 1, max_sets, sw_ws, exc,
+                )
+                refreshed = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
+                if refreshed is None:
+                    refreshed = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
+                if refreshed is not None:
+                    sw_ws = refreshed
         self._retry_token_after_offscreen(inst, sw_ws, payload)
 
     def _retry_token_after_offscreen(
@@ -1604,6 +1628,126 @@ class Daemon:
         return 0
 
 
+
+class IdlePresenterThread:
+    """Idle-браузер для стрима, как legacy provider-app-idle.py: Chromium с
+    РАСШИРЕНИЕМ на CEKI_DAEMON_IDLE_DISPLAY (:250), открытая сайдпанель и
+    CEKI_DAEMON_IDLE_URL (ceki.me) в окне. Вид idle = полная страница + сайдбар
+    плагина (а не голый новый-таб / лого). todo repl: ренты на 151-153 не
+    затрагиваются."""
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not os.environ.get("CEKI_DAEMON_IDLE_URL", "").strip():
+            log.info("idle-presenter: CEKI_DAEMON_IDLE_URL не задан, idle не запускаем")
+            return
+        self._thread = threading.Thread(target=self._run_forever, daemon=True, name="idle-presenter")
+        self._thread.start()
+
+    def stop_now(self) -> None:
+        self._stop.set()
+
+    def _launch_once(self) -> None:
+        import tempfile, time as _t, subprocess as _sp
+        from playwright.sync_api import sync_playwright
+        disp = os.environ.get("CEKI_DAEMON_IDLE_DISPLAY", "250")
+        idle_url = os.environ.get("CEKI_DAEMON_IDLE_URL", "https://ceki.me")
+        ext_dir = os.environ.get("CEKI_PROVIDER_EXT_DIR", "/opt/ceki/extension")
+        width = 1920; height = 1080
+
+        # Поднять свой Xvfb на idle-дисплее, если его нет (сокет -> X-шар).
+        os.makedirs("/tmp/.X11-unix", exist_ok=True)
+        # Пересоздаём Xvfb на idle-дисплее начисто: старый сокет/лок от прежнего
+        # презентера мог остаться, и Xvfb умирает при старте (не может bind).
+        try:
+            os.unlink(f"/tmp/.X11-unix/X{disp}")
+        except OSError:
+            pass
+        try:
+            os.unlink(f"/tmp/.X{disp}-lock")
+        except OSError:
+            pass
+        _sp.Popen(["Xvfb", f":{disp}", "-screen", "0", f"{width}x{height}x24", "-nolisten", "tcp"],
+                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, start_new_session=True)
+        for _i in range(40):
+            if os.path.exists(f"/tmp/.X11-unix/X{disp}"):
+                break
+            _t.sleep(0.5)
+        log.info("idle-presenter: поднят Xvfb :%s (сокет %s)", disp, os.path.exists(f"/tmp/.X11-unix/X{disp}"))
+
+        profile = tempfile.mkdtemp(prefix="ceki-idle-")
+        env = dict(os.environ); env["DISPLAY"] = f":{disp}"; os.environ["DISPLAY"] = f":{disp}"
+        try:
+            with sync_playwright() as p:
+                ctx = p.chromium.launch_persistent_context(
+                    profile, headless=False,
+                    args=["--no-sandbox","--disable-gpu","--disable-dev-shm-usage","--no-first-run",
+                          f"--load-extension={ext_dir}", f"--disable-extensions-except={ext_dir}",
+                          "--window-position=0,0", f"--window-size={width},{height}"],
+                    ignore_default_args=["--disable-extensions"],
+                    viewport=None, env=env,
+                )
+                # Открыть панель расширения (как legacy _open_panel).
+                panel = None
+                for path in ("panel/index.html", "panel.html", "popup.html"):
+                    try:
+                        p0 = ctx.new_page()
+                        p0.goto(f"chrome-extension://{_DEFAULT_EXT_ID}/{path}", wait_until="domcontentloaded", timeout=10000)
+                        panel = p0; break
+                    except Exception:
+                        p0.close()
+                if panel is not None:
+                    # seed настроек через панель (storage.local)
+                    try:
+                        panel.evaluate(
+                            "(async (s) => { await chrome.storage.local.set(s); return JSON.stringify(await chrome.storage.local.get(Object.keys(s))); })",
+                            {"open_window_normal": True, "open_window_focused": True, "restore_focus_on_rental": False},
+                        )
+                        log.info("idle-presenter: settings seeded")
+                    except Exception as exc:
+                        log.warning("idle-presenter: seed failed: %s", exc)
+                    # сайдбар
+                    try:
+                        panel.evaluate(
+                            "(async () => { const w = await chrome.windows.getCurrent(); "
+                            "if (!w || w.id === undefined) return 'ERR no-window'; "
+                            "await chrome.sidePanel.open({ windowId: w.id }); return 'ok window=' + w.id; })()"
+                        )
+                        log.info("idle-presenter: sidepanel open attempt ok")
+                    except Exception as exc:
+                        log.warning("idle-presenter: sidepanel open failed: %s", exc)
+                    # максимум окна через CDP
+                    try:
+                        cdp = ctx.new_cdp_session(panel)
+                        win = cdp.send("Browser.getWindowForTarget")
+                        cdp.send("Browser.setWindowBounds", {"windowId": win["windowId"],
+                            "bounds": {"left":0,"top":0,"width":width,"height":height,"windowState":"normal"}})
+                    except Exception:
+                        pass
+                    # навигация на страницу
+                    try:
+                        panel.goto(idle_url, wait_until="domcontentloaded", timeout=25000)
+                        log.info("idle-presenter: idle page shown: %s", idle_url)
+                    except Exception as exc:
+                        log.warning("idle-presenter: goto failed: %s", exc)
+                while not self._stop.is_set():
+                    _t.sleep(3)
+                ctx.close()
+        finally:
+            pass
+
+    def _run_forever(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._launch_once()
+            except Exception as exc:
+                log.warning("idle-presenter: crashed: %r — рестарт через 10с", exc)
+                import time as _t; _t.sleep(10)
+
+
 def _setup_logging() -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
@@ -1646,7 +1790,13 @@ def main(argv: list[str] | None = None) -> int:
         cfg.persist,
     )
     daemon = Daemon(cfg)
-    return daemon.run()
+    # idle-презентер: постоянный браузер на :250 с страницей (когда рент нет)
+    idle = IdlePresenterThread()
+    idle.start()
+    try:
+        return daemon.run()
+    finally:
+        idle.stop_now()
 
 
 if __name__ == "__main__":
