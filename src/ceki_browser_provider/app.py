@@ -126,12 +126,12 @@ _EXTERNAL_POLICY_DIRS = [
 # adds Yandex Browser and selects it via env — the same launcher code drives
 # either binary.
 _BROWSER_FLAVORS = {
-    "chromium": None,  # None → Playwright's pinned Chromium (default)
+    "chromium": "/usr/bin/chromium",  # system Chromium (full CDP)
     "yandex": "/usr/bin/yandex-browser",
-    # pseudo-yandex: plain Playwright Chromium pretending to be YaBrowser —
-    # UA string + Client Hints override at launch (see _UA_OVERRIDE / apply).
-    # NOT a real Yandex build: no Yandex internals, ytrust, config channels.
-    "pseudo-yandex": None,
+    # pseudo-yandex: plain Chromium pretending to be YaBrowser — UA string +
+    # Client Hints override at launch (see _UA_OVERRIDE / apply). Uses the
+    # same system binary as chromium.
+    "pseudo-yandex": "/usr/bin/chromium",
 }
 
 # pseudo-yandex UA. Yandex Browser's UA format is

@@ -20,5 +20,8 @@ Dockerfile.yandex-c266
 .env*
 Dockerfile.dev-daemon-overlay
 
+# Backups / temporal artifacts (never commit).
+*.bak_*
+
 # Local persist-profile bind dir (real Chrome profiles, never commit).
 .persist-sessions/

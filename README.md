@@ -169,6 +169,43 @@ CEKI_BROWSER_FLAVOR=pseudo-yandex ./build.sh   # pseudo-yandex → ceki/provider
 This produces the image locally. The published images (all three flavors) are
 built from tagged releases by `.github/workflows/docker-publish.yml`.
 
+## Testing
+
+E2E scripts live in `scripts/`. They require a live Ceki relay + backend and a
+renter **agent token** (`CEKI_API_KEY` / `CEKI_AGENT_TOKEN`). They never write
+into the repo (screenshots/artifacts go to `/tmp` or the caller's env).
+
+### `e2e-multirent-isolation.py` — multi-rent window isolation (app mode)
+
+Checks that CDP actions from concurrent rental sessions on ONE app-mode provider
+land in the correct window/tab. Each renter navigates to its own site, plants a
+unique DOM marker, and the script verifies both directions:
+- **positive** — each session sees its own marker in its own window (action
+  reached the expected tab), and
+- **negative** — no session sees any other session's marker (no cross-window
+  bleed).
+
+Mode `main` (Test A) and `incognito` (Test B). Preflight warns/aborts when the
+schedule is not `multi_session=true`.
+
+```bash
+CEKI_API_URL=https://api.ceki.me \
+CEKI_RELAY_URL=wss://browser.ceki.me/ws/agent \
+CEKI_API_KEY=<renter-agent-token> \
+SCHEDULE_ID=<prod-schedule-multi-session> \
+python3 scripts/e2e-multirent-isolation.py --mode incognito
+```
+
+`--sessions N` controls the concurrency (default 3), `--retry N` runs passes,
+`--diag http://127.0.0.1:<cdp>` dumps the extension's internal session→tab map
+after the run (requires the provider container's CDP port), `--no-preflight`
+skips the settings check.
+
+### `e2e-daemon-parallel.sh` — daemon parallel + persist (ev 9095)
+
+Acceptance for the provider daemon's parallel-session pool and persist-profile
+mode. Self-contained reference of ev 9095 manual checks. See the script header.
+
 ## Notes
 
 - In `app` mode (default) one container serves one browser. To run several

@@ -12,6 +12,12 @@
 
 set -e
 
+# Chrome (esp. for Testing) opens hundreds of file descriptors across its
+# renderer/utility processes; the docker default soft limit (1024) is a common
+# cause of "CDP port ConnectionRefused" after many subprocesses. Raise it for
+# the whole provider process tree (hard limit 524288 allows this).
+ulimit -n 65536 2>/dev/null || true
+
 # Inherit a non-UTC timezone so the provider browser matches the IP geolocation.
 # Priority: TZ env (compose passes ${TZ:-}) → /etc/timezone.
 if [ -z "${TZ:-}" ] && [ -f /etc/timezone ]; then

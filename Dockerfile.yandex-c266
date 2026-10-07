@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+#
+# Ceki headless-browser provider image — YANDEX flavor (real Yandex Browser 26.6).
+# Based on the working ceki/provider:yandex-daemon-c266 image, with updated daemon.py.
+
+FROM ceki/provider:yandex-daemon-c266
+
+LABEL org.opencontainers.image.source=https://github.com/Ceki-me/docker-browser \
+      org.opencontainers.image.title=ceki-browser-provider-yandex-c266 \
+      org.opencontainers.image.description="Ceki headless-browser provider image: Yandex Browser 26.6 corporate + browser extension + provider launcher (with CDP isolation fixes)"
+
+WORKDIR /opt/ceki
+
+# Copy the fixed daemon.py with CDP isolation fixes
+COPY src/ceki_browser_provider/daemon.py /opt/ceki/src/ceki_browser_provider/daemon.py
+
+# Re-stage extension (in case it was updated)
+COPY extension/ /opt/ceki/extension/
+
+ENTRYPOINT ["/usr/local/bin/ceki-entrypoint"]
+CMD ["python", "-m", "ceki_browser_provider.app"]

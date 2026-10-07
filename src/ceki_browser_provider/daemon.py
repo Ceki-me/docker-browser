@@ -163,6 +163,7 @@ class ProxySpec:
     port: int
     username: str | None = None
     password: str | None = None
+    bypass_extra: tuple[str, ...] = ()
 
     @property
     def server_url(self) -> str:
@@ -170,6 +171,15 @@ class ProxySpec:
         rejects user:pass in the flag; auth is answered by the extension via
         webRequest.onAuthRequired instead."""
         return f"{self.scheme}://{self.host}:{self.port}"
+
+    @property
+    def bypass_list(self) -> list[str]:
+        """Chrome proxy bypass list. Base entries never route through the
+        proxy; ``CEKI_PROXY_BYPASS_EXTRA`` (space- or comma-separated) appends
+        operator entries (e.g. internal hosts) without hard-coding them here."""
+        base = ["<local>", "localhost", "127.0.0.1", "::1", "*.ceki.me", "*.ceki.com"]
+        extra = [e.strip() for e in os.environ.get("CEKI_PROXY_BYPASS_EXTRA", "").replace("\n", " ").split() if e.strip()]
+        return base + extra
 
 
 @dataclass
@@ -684,26 +694,14 @@ class SpawnManager:
     def _build_chrome_args(self, inst: Instance, ext_dir: str) -> list[str]:
         args = list(_CHROME_ARGS)
         if self.cfg.proxy:
-            if self.cfg.policy_installed_ext:
-                # Branded Yandex: chrome.proxy.settings is NOT honored by its
-                # incognito profile, and --proxy-server WITHOUT creds hangs
-                # every request on the proxy 407 → the renderer paints a blank
-                # frame. Embed the creds in the flag URL: Yandex/Chromium
-                # consume `user:pass@host:port` from --proxy-server (auth for
-                # http CONNECT), which avoids the 407 stall entirely.
-                userinfo = ""
-                if self.cfg.proxy.username or self.cfg.proxy.password:
-                    userinfo = f"{quote(self.cfg.proxy.username or '', safe='')}:{quote(self.cfg.proxy.password or '', safe='')}@"
-                args.append(f"--proxy-server={self.cfg.proxy.scheme}://{userinfo}{self.cfg.proxy.host}:{self.cfg.proxy.port}")
-                args.append(
-                    "--proxy-bypass-list=<local>;localhost;127.0.0.1;::1;"
-                    "*.ittribe.org;*.ceki.me;*.ceki.com;172.21.0.1"
-                )
-                log.info("daemon: yandex rental proxy with creds -> %s://%s:%d", self.cfg.proxy.scheme, self.cfg.proxy.host, self.cfg.proxy.port)
-            else:
-                # Plain Chromium: extension applies chrome.proxy.settings
-                # (regular + incognito) — works with auth via webRequest.
-                log.info("daemon: chromium rental proxy applied by extension -> %s", self.cfg.proxy.server_url)
+            # Proxy is applied by the EXTENSION via chrome.proxy.settings
+            # (seeded from env → storage ceki_proxy). Verified: --proxy-server
+            # is NOT honored by Yandex corporate on the network level — without
+            # creds it 407-stalls (white frame), with creds it yields
+            # chrome-error:// (unreachable page). chrome.proxy.settings from
+            # the extension is the only path that actually tunnels (works on
+            # Chrome; fixing Yandex adoption is the current task).
+            log.info("daemon: rental proxy applied by extension -> %s", self.cfg.proxy.server_url)
         args.append(f"--window-size={self.cfg.width},{self.cfg.height}")
         args.append(f"--user-data-dir={inst.profile_dir}")
         args.append(f"--disk-cache-dir={inst.profile_dir}/cache")
@@ -905,19 +903,7 @@ class SpawnManager:
                     "host": self.cfg.proxy.host,
                     "port": self.cfg.proxy.port,
                 },
-                "bypass_list": [
-                    "<local>",
-                    "localhost",
-                    "127.0.0.1",
-                    "::1",
-                    "*.ittribe.org",
-                    "*.ceki.me",
-                    "*.ceki.com",
-                    "browser.ittribe.org",
-                    "clawapi.ittribe.org",
-                    "chat.ittribe.org",
-                    "172.21.0.1",
-                ],
+                "bypass_list": self.cfg.proxy.bypass_list,
             }
 
         prefs_path.write_text(json.dumps(prefs))
