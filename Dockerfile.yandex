@@ -33,7 +33,6 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     DISPLAY=:99 \
     PYTHONPATH=/opt/ceki/src
 
@@ -45,12 +44,16 @@ LABEL org.opencontainers.image.source=https://github.com/Ceki-me/docker-browser 
 
 # Yandex Browser runtime libraries (superset of Chromium's) + Xvfb virtual
 # display + libnss3-tools (certutil for the NSS trust DB — see the CA block).
+# chromium (apt, system) is installed too: app.py maps the "chromium" /
+# "pseudo-yandex" flavors to /usr/bin/chromium, so the yandex image also
+# carries the same system-Chromium fallback binary the base Dockerfile uses
+# (full CDP incl. Browser.setDownloadBehavior).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libnss3 libnspr4 libnss3-tools libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
         libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 \
         libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 libxshmfence1 \
         libglib2.0-0 libgdk-pixbuf-2.0-0 xvfb xauth x11-utils ca-certificates curl \
-        wget gnupg \
+        wget gnupg chromium \
     && rm -rf /var/lib/apt/lists/*
 
 # Russian Trusted Root CA / Sub CA (Минцифры, НУЦ) — see Dockerfile for the
@@ -108,10 +111,11 @@ RUN wget -qO- https://repo.yandex.ru/yandex-browser/YANDEX-BROWSER-KEY.GPG \
     && case "$VER" in 26.6) echo "OK: yandex 26.6 (known-good corporate build)";; *) echo "FATAL: yandex $VER != 26.6 — corporate 26.6 is the only build the extension supports. Do NOT ship this image."; exit 1;; esac \
     && rm -rf /var/lib/apt/lists/*
 
-# Playwright's Chromium stays installed as a fallback binary (app.py falls back
-# with a warning if the Yandex binary is missing) and for the pseudo-yandex
-# style UA tooling.
-RUN python -m playwright install chromium
+# The real Yandex Browser (corporate 26.6) is the rented browser. The
+# system chromium above (apt) is the same full-CDP fallback binary the base
+# Dockerfile uses; app.py picks the binary per flavor.
+# No `playwright install chromium` — the bundled Playwright library drives
+# /usr/bin/chromium via executable_path (system Chromium, full CDP).
 
 # This image rents out the real Yandex Browser (settable at runtime; the
 # chromium image is the one to use for CEKI_PROVIDER_BROWSER=chromium).
