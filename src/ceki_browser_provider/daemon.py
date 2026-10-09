@@ -229,6 +229,41 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _schedule_max_sessions(api_base: str, token: str, schedule_id: int | None) -> int:
+    """Best-effort: read the schedule's multi-session capacity from the backend.
+
+    Fetches /api/browser/me (the same card the extension pulls on connect) and
+    returns ``settings.max_sessions`` when the schedule advertises
+    multi_sessions. Any failure returns 0 so the caller falls back to the
+    default of 1 — the daemon must still start when the backend is unreachable.
+    """
+    try:
+        resp = httpx.get(
+            f"{api_base}/api/browser/me",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        s = data.get("settings", {}) if isinstance(data, dict) else {}
+        if s.get("multi_session") is True:
+            n = s.get("max_sessions")
+            n = int(n) if n not in (None, "") else 0
+            if n > 0:
+                log.info(
+                    "daemon: adopting schedule max_sessions=%d (multi_session) for schedule %s",
+                    n, schedule_id,
+                )
+                return n
+        log.info(
+            "daemon: schedule %s multi_session=%s max_sessions=%s -> default 1",
+            schedule_id, s.get("multi_session"), s.get("max_sessions"),
+        )
+    except Exception as exc:
+        log.warning("daemon: schedule fetch failed (%s) — default max_sessions=1", exc)
+    return 0
+
+
 def _proxy_from_env() -> ProxySpec | None:
     """Parse proxy config from container env.
 
@@ -314,7 +349,17 @@ def load_config() -> DaemonConfig:
         except ValueError:
             schedule_id = None
 
-    max_sessions = int(os.environ.get("CEKI_DAEMON_MAX_SESSIONS", "1"))
+    max_sessions_env = os.environ.get("CEKI_DAEMON_MAX_SESSIONS")
+    max_sessions = int(max_sessions_env) if max_sessions_env and max_sessions_env.strip() else 0
+    # If the operator did not pin CEKI_DAEMON_MAX_SESSIONS, adopt the schedule's
+    # own multi-session capacity from the backend (settings.max_sessions). The
+    # daemon otherwise defaults to 1 and rejects parallel rents even when the
+    # schedule advertises multi_session (e.g. subscription rents on 42306/42307
+    # with max_sessions=10). The schedule card is fetched with the same provider
+    # token the daemon uses on the provider WS; a failure is non-fatal (keep 1).
+    if max_sessions <= 0:
+        max_sessions = _schedule_max_sessions(api_base, token, schedule_id)
+
     cdp_start = int(os.environ.get("CEKI_DAEMON_CDP_START", str(DEFAULT_CDP_PORT_START)))
     display_start = int(os.environ.get("CEKI_DAEMON_DISPLAY_START", str(DEFAULT_DISPLAY_START)))
 
