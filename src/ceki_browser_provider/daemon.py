@@ -246,11 +246,30 @@ def _schedule_max_sessions(api_base: str, token: str, schedule_id: int | None) -
     default of 1 — the daemon must still start when the backend is unreachable.
     """
     try:
-        resp = httpx.get(
-            f"{api_base}/api/browser/me",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-            timeout=15,
-        )
+        # The provider daemon dials the backend through the SAME outbound
+        # proxy the rented browsers use (CEKI_PROXY_URL), so the server sees
+        # the proxy egress IP and can assign the right geo to this schedule.
+        # Without a proxy configured this is a direct call (unchanged).
+        _proxy = _proxy_from_env()
+        _proxy_url = None
+        if _proxy:
+            # Embed credentials in the proxy URL: httpx sends Proxy-Authorization
+            # from the URL userinfo (a bare host:port without creds → 407).
+            _netloc = _proxy.host
+            if _proxy.port:
+                _netloc += f":{_proxy.port}"
+            if _proxy.username:
+                from urllib.parse import quote
+                _netloc = f"{quote(_proxy.username, safe='')}:{quote(_proxy.password or '', safe='')}@{_netloc}"
+            _proxy_url = f"{_proxy.scheme}://{_netloc}"
+        _client = httpx.Client(proxy=_proxy_url, timeout=15)
+        try:
+            resp = _client.get(
+                f"{api_base}/api/browser/me",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+        finally:
+            _client.close()
         resp.raise_for_status()
         data = resp.json()
         s = data.get("settings", {}) if isinstance(data, dict) else {}
