@@ -1306,8 +1306,11 @@ class SpawnManager:
                     return ws_url
             except Exception:
                 continue  # 500 / refused / stale — try next
-        # No WS-connectable candidate: fall back to the newest.
-        return candidates[-1].get("webSocketDebuggerUrl")
+        # No WS-connectable candidate. Do NOT fall back to a dead target:
+        # storage.set there answers 500 and the handshake stalls. Return None
+        # so the caller keeps polling — a healthy worker appears a moment
+        # later (Chromium 154 spawns the extension SW async after launch).
+        return None
 
     def _find_offscreen_target(self, inst: Instance) -> str | None:
         """Return the CDP ws URL of the extension's offscreen document, if the
