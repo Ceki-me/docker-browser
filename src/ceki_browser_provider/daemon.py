@@ -386,8 +386,8 @@ def load_config() -> DaemonConfig:
         # corporate build strips --load-extension, so the daemon must not rely
         # on an unpacked copy there.
         policy_installed_ext=(os.environ.get("CEKI_PROVIDER_BROWSER") == "yandex"),
-        cdps=list(range(cdp_start, cdp_start + max_sessions)),
-        displays=list(range(display_start, display_start + max_sessions)),
+        cdps=list(range(cdp_start, cdp_start + max(1, max_sessions))),
+        displays=list(range(display_start, display_start + max(1, max_sessions))),
         proxy=_proxy_from_env(),
     )
     cfg.local_ws_url = f"ws://127.0.0.1:{cfg.daemon_port}"
@@ -1060,14 +1060,15 @@ class SpawnManager:
                 sw_ws = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
             log.info("handshake: yandex storage channel -> %s", ("offscreen" if "offscreen" in (sw_ws or "") else "sw"))
         else:
+            # The token MUST land in the extension's service worker: that is the
+            # context whose storage.onChanged pushes token_updated to the
+            # offscreen doc (which opens the presence-WS). The background page
+            # target on Chromium 154 answers CDP but has NO extension API
+            # (chrome is undefined) — writing storage.set there fails silently
+            # and the rent dies without a presence-WS. Prefer the SW; fall back
+            # to background_page only if no SW target exists at all.
             sw_ws = None
             for _ in range(40):
-                # System Chromium 154 answers the extension SW target's CDP WS
-                # with 500, while the background page responds fine — try the
-                # background page FIRST so the token handshake actually lands.
-                sw_ws = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
-                if sw_ws is not None:
-                    break
                 sw_ws = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
                 if sw_ws is not None:
                     break
