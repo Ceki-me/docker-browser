@@ -151,6 +151,16 @@ def provider_browser_name() -> str:
     return _FLAVOR_NAMES.get(provider_browser_flavor(), "Chrome")
 
 
+def _pseudo_yandex_enabled() -> bool:
+    """True when the daemon must serve the YaBrowser UA on rent pages.
+
+    Only the pseudo-yandex flavor enables the spoof. Real yandex ships the UA
+    natively. The flavor reports ``yandex`` (same alias), so we must compare
+    the raw env value, not ``provider_browser_flavor()``.
+    """
+    return os.environ.get("CEKI_PROVIDER_BROWSER", "chromium").strip().lower() == "pseudo-yandex"
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -703,6 +713,12 @@ class SpawnManager:
             # Chrome; fixing Yandex adoption is the current task).
             log.info("daemon: rental proxy applied by extension -> %s", self.cfg.proxy.server_url)
         args.append(f"--window-size={self.cfg.width},{self.cfg.height}")
+        if _pseudo_yandex_enabled():
+            # pseudo-yandex: launch-level YaBrowser UA. Page-level CDP override
+            # conflicts with the extension's chrome.debugger session on system
+            # Chromium 154 (SW CDP answers 500 and the rent dies) — this is the
+            # only path that survives the handshake.
+            args.append("--user-agent=" + provider_app._PSEUDO_UA)
         args.append(f"--user-data-dir={inst.profile_dir}")
         args.append(f"--disk-cache-dir={inst.profile_dir}/cache")
         args.append(f"--remote-debugging-port={inst.cdp_port}")
@@ -938,6 +954,9 @@ class SpawnManager:
         #    Deferred so the extension's session tab (about:blank) opens first;
         #    failures are non-fatal.
         threading.Timer(2.0, self._close_idle_tabs, args=(inst,)).start()
+        # pseudo-yandex YaBrowser UA is applied at launch (--user-agent in
+        # _build_chrome_args); page-level CDP patching conflicts with the
+        # extension's debugger session on Chromium 154 and kills the rent.
 
     def _discover_ext_id(self, inst: Instance, expected: str | None = None,
                          timeout: float = 60) -> str | None:
@@ -998,6 +1017,12 @@ class SpawnManager:
         else:
             sw_ws = None
             for _ in range(40):
+                # System Chromium 154 answers the extension SW target's CDP WS
+                # with 500, while the background page responds fine — try the
+                # background page FIRST so the token handshake actually lands.
+                sw_ws = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
+                if sw_ws is not None:
+                    break
                 sw_ws = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
                 if sw_ws is not None:
                     break
@@ -1327,11 +1352,14 @@ class SpawnManager:
                 return t.get("webSocketDebuggerUrl")
         return None
 
-    def _cdp_eval(self, ws_url: str, expression: str, timeout: float = 5.0) -> Any:
-        """Evaluate ``expression`` in a CDP target via its webSocketDebuggerUrl.
+    def _cdp_send(self, ws_url: str, method: str, params: dict | None = None,
+                  timeout: float = 5.0) -> Any:
+        """Send one CDP command to a target and return its result.
 
+        Shared transport for ``_cdp_eval`` (Runtime.evaluate) and
+        ``_cdp_command`` (any other method, e.g. Network.setUserAgentOverride).
         Short timeout (5s): during spawn the extension SW may appear in
-        /json/list before it is ready to serve CDP — a 20s eval turned one
+        /json/list before it is ready to serve CDP — a 20s send turned one
         retry loop into an 80s stall and the watchdog reaped the rent. A fast
         refusal lets the caller's retry/refresh/relaunch path kick in quickly.
         """
@@ -1345,24 +1373,37 @@ class SpawnManager:
                     request_id = 1
                     await sock.send(json.dumps({
                         "id": request_id,
-                        "method": "Runtime.evaluate",
-                        "params": {
-                            "expression": expression,
-                            "awaitPromise": True,
-                            "returnByValue": True,
-                        },
+                        "method": method,
+                        "params": params or {},
                     }))
                     while True:
                         msg = json.loads(await asyncio.wait_for(sock.recv(), timeout=timeout))
                         if msg.get("id") == request_id:
                             if "error" in msg:
                                 raise RuntimeError(f"CDP error: {msg['error']}")
-                            res = msg.get("result", {}).get("result", {})
-                            return res.get("value")
+                            return msg.get("result", {})
             except Exception as exc:
-                log.warning("cdp: CDP eval failed ws=%s : %r", ws_url, exc)
+                log.warning("cdp: CDP %s failed ws=%s : %r", method, ws_url, exc)
                 raise
         return asyncio.run(_run())
+
+    def _cdp_eval(self, ws_url: str, expression: str, timeout: float = 5.0) -> Any:
+        """Evaluate ``expression`` in a CDP target via its webSocketDebuggerUrl."""
+        res = self._cdp_send(
+            ws_url, "Runtime.evaluate", {
+                "expression": expression,
+                "awaitPromise": True,
+                "returnByValue": True,
+            }, timeout=timeout,
+        )
+        return (res or {}).get("result", {}).get("value")
+
+    # -- pseudo-yandex UA ------------------------------------------------
+    # The YaBrowser UA is applied at LAUNCH via --user-agent (see
+    # _build_chrome_args). Page-level Network.setUserAgentOverride over a
+    # daemon-owned WS conflicts with the extension's own chrome.debugger
+    # session on system Chromium 154 (SW CDP answers 500) and breaks the
+    # rental; launch-level is the only path that survives the handshake.
 
     def _close_idle_tabs(self, inst: Instance) -> None:
         """Close Yandex's default background surfaces after launch.
@@ -1671,6 +1712,7 @@ class ProviderWsClient:
             inbox.put_nowait(None)
 
     async def run(self) -> None:
+        import time as _time
         while not self._stop:
             try:
                 async with websockets.connect(
@@ -1680,7 +1722,7 @@ class ProviderWsClient:
                     ping_interval=None,  # relay drives ping itself
                 ) as ws:
                     self.ws = ws
-                    self._reconnect_delay = 1.0
+                    self._conn_started = _time.monotonic()
                     log.info("provider-ws: connected %s", self.relay_url)
                     await self.send({
                         "type": "welcome",
@@ -1727,6 +1769,14 @@ class ProviderWsClient:
             if self._stop:
                 break
             self.ws = None
+            # Anti-reconnect-storm: if the connection died within a few seconds
+            # of connecting (e.g. the relay rejecting/closing us, or a token
+            # burst), keep growing the backoff — do NOT reset it on a short
+            # lived connection, or we flap 1/s forever. Reset only after the
+            # link held for a healthy stretch.
+            stayed = _time.monotonic() - getattr(self, "_conn_started", _time.monotonic())
+            if stayed >= 10.0:
+                self._reconnect_delay = 1.0
             await asyncio.sleep(self._reconnect_delay)
             self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
 
