@@ -1293,23 +1293,21 @@ class SpawnManager:
             candidates.append(t)
         if not candidates:
             return None
-        # newest (last listed) first; try each with a quick TCP connect
-        import socket as _socket
-
+        # newest (last listed) first; probe each with a real WS handshake.
+        # A plain TCP connect is NOT enough on Chromium 154: the port is open
+        # but the WS-upgrade to a stale/stopped extension worker answers
+        # HTTP 500 (and the storage handshake dies). Return the first target
+        # whose WS-upgrade actually succeeds.
+        import websockets.sync.client as _wscl
         for t in reversed(candidates):
             ws_url = t.get("webSocketDebuggerUrl") or ""
-            # ws://127.0.0.1:<port>/devtools/page/<id>
-            m = __import__("re").match(r"ws://[^:]+:(\d+)/", ws_url)
-            if m:
-                port = int(m.group(1))
-                try:
-                    s = _socket.create_connection(("127.0.0.1", port), timeout=0.3)
-                    s.close()
+            try:
+                with _wscl.connect(ws_url, open_timeout=1.0, close_timeout=0.2):
                     return ws_url
-                except OSError:
-                    continue  # dead/stale target — try next
-        # fallback: first candidate (best effort)
-        return candidates[0].get("webSocketDebuggerUrl")
+            except Exception:
+                continue  # 500 / refused / stale — try next
+        # No WS-connectable candidate: fall back to the newest.
+        return candidates[-1].get("webSocketDebuggerUrl")
 
     def _find_offscreen_target(self, inst: Instance) -> str | None:
         """Return the CDP ws URL of the extension's offscreen document, if the
