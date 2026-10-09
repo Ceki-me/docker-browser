@@ -19,6 +19,7 @@ Dockerfile.dev*
 Dockerfile.yandex-c266
 *.env
 .env*
+!.env.example
 Dockerfile.dev-daemon-overlay
 
 # Backups / temporal artifacts (never commit).

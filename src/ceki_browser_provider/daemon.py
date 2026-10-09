@@ -89,6 +89,14 @@ _CHROME_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--lang=en-US",
     "--window-position=0,0",
+    # Chromium 150+ closes remote-debugging access to extension targets by
+    # default: /json/list still lists the extension SW, but WS-upgrade to it
+    # answers HTTP 500 and the token handshake dies (storage never lands, no
+    # presence-WS). These two switches re-open extension targets to the
+    # debugging port. Verified needed on system Chromium 154 (unbranded);
+    # Yandex corporate ignores them (it gates extension debugging elsewhere).
+    "--remote-debugging-allow-extension-targets",
+    "--enable-unsafe-extension-debugging",
     # Idle-rent memory/CPU: without these, Yandex opens ya.ru as the home
     # page plus its native chrome://wallpaper / alissenger-bubble surfaces —
     # ~5 renderer processes / ~1.9GB for an otherwise-blank rent. Keep the
@@ -1219,127 +1227,47 @@ class SpawnManager:
     def _retry_token_after_offscreen(
         self, inst: Instance, sw_ws: str, payload: dict
     ) -> None:
-        """Keep re-delivering the token until the presence-WS connects.
+        """Keep the token set until the extension's presence-WS connects.
 
-        The first ``storage.local.set`` fires ``storage.onChanged`` immediately,
-        while the SW's ``offscreenPort`` may still be null (offscreen document
-        not created yet). ``sendToOffscreen(token_updated)`` is then a no-op and
-        the message is lost; when offscreen later connects, ``offscreen_hello``
-        sees ``sanctum_token === _lastKnownToken`` and skips ``token_updated`` —
-        so the offscreen never opens its presence-WS (QA repro, ev 8639).
-
-        Fix on the daemon side (no extension change): clear the token and
-        re-set it *repeatedly* until the extension's presence-WS actually
-        connects. The second+ ``onChanged`` fires ``token_cleared`` then
-        ``token_updated`` into the live ``offscreenPort``. A SINGLE clear+set
-        is not enough under parallel spawn: the offscreen page target can be
-        visible over CDP while its module script (which registers the token
-        callback) has not run yet — a re-delivery in that window is lost the
-        same way as the first, and the instance stalls without a presence-WS
-        until the watchdog reaps it (B9 1-of-3 loss, ev 10077). Loop the
-        clear+set until the WS is up or a generous deadline (the watchdog's
-        connect timeout) expires.
+        Chromium 154: the offscreen document (which opens the presence-WS) is
+        created by the extension SW only AFTER a stable sanctum_token lands in
+        chrome.storage.local. Destructive clear+set loops the token_cleared /
+        token_updated events so fast the offscreen never stabilises. Instead:
+        write (or re-write) the token + relay config, then poll for the offscreen
+        CDP target and finally wait for presence-WS — no removes.
         """
         deadline = time.time() + int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90"))
-        # The offscreen may not exist yet (document not created). Wait for the
-        # CDP page target first so a clear+set has a live offscreen to receive
-        # the re-delivery.
-        for _ in range(60):  # up to ~30s for offscreen to appear
-            if self._find_offscreen_target(inst) is not None:
-                break
-            time.sleep(0.5)
-        else:
-            log.warning("handshake[%s]: offscreen target never appeared, token may be lost", inst.session_id)
-
-        round_no = 0
+        # 1. Ensure the token/config is set (idempotent — re-set refreshes the
+        #    storage.onChanged trigger without tearing the SW down).
+        re_set = 0
         while time.time() < deadline:
-            round_no += 1
-            ws = inst.ws
+            # If presence already connected, done.
+            ws = getattr(inst, "ws", None)
             if ws is not None and getattr(ws, "state", 3) == 1:
-                log.info(
-                    "handshake[%s]: presence-WS connected (round %d)",
-                    inst.session_id, round_no,
-                )
+                log.info("handshake: presence-WS connected (re-set round %d)", re_set)
                 return
-            # Re-resolve the SW target: CDP evals can outlive the SW (it may
-            # have been torn down under load) — a stale ws_url just errors.
+            # Re-resolve SW target (stale WS after relaunch / 500).
             cur_sw = sw_ws
-            if round_no > 1:
-                found = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
-                if found is None:
-                    found = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
-                if found is not None:
-                    cur_sw = found
-            # Clear then re-set: onChanged fires token_cleared then
-            # token_updated, now delivering into the live offscreenPort.
-            clear_ok = False
-            try:
-                self._cdp_eval(cur_sw, "chrome.storage.local.remove('sanctum_token', () => true)")
-                clear_ok = True
-            except Exception as exc:
-                log.warning("handshake[%s]: token clear failed: %s", inst.session_id, exc)
-            time.sleep(0.5)  # let the onChanged debounce (50ms + tick) process
-            try:
-                if clear_ok:
-                    result = self._cdp_eval(
-                        cur_sw,
-                        "chrome.storage.local.set(" + json.dumps(payload) + ", () => true)",
-                    )
-                    log.info(
-                        "handshake[%s]: token re-set (round %d) -> %s",
-                        inst.session_id, round_no, json.dumps(result)[:120],
-                    )
-            except Exception as exc:
-                log.warning("handshake[%s]: token re-set failed: %s", inst.session_id, exc)
-
-# Re-check right before the destructive clear: if the extension
-        # connected during the window above (token was delivered), skip.
-        ws = inst.ws
-        if ws is not None and getattr(ws, "state", 3) == 1:
-            log.info("handshake: presence-WS connected during wait, skipping re-delivery")
-            return
-
-        # Clear then re-set: onChanged fires token_cleared then token_updated,
-        # now delivering into the live offscreenPort.
-        # The SW ws may have gone stale (Yandex CDP WS-upgrade 500) while we
-        # waited for the offscreen — re-resolve before/after each destructive
-        # write so the re-delivery lands (kills the intermittent rent stall).
-        def _refresh_sw_ws() -> str | None:
-            r = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
-            if r is None:
-                r = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
-            return r
-
-        cleared = False
-        for attempt in range(4):
-            try:
-                self._cdp_eval(sw_ws, "chrome.storage.local.remove('sanctum_token', () => true)")
-                cleared = True
-                log.info("handshake: token cleared for re-delivery")
-                break
-            except Exception as exc:
-                log.warning("handshake: token clear attempt %d failed: %s", attempt + 1, exc)
-                refreshed = _refresh_sw_ws()
-                if refreshed and refreshed != sw_ws:
-                    log.info("handshake: SW target changed for clear %s -> %s", sw_ws, refreshed)
-                    sw_ws = refreshed
-                time.sleep(1.0)
-        time.sleep(0.7)  # let the onChanged debounce (50ms + tick) process
-        for attempt in range(6):
+            found = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
+            if found is None:
+                found = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
+            if found is not None:
+                cur_sw = found
             try:
                 self._cdp_eval(
-                    sw_ws,
-                    "chrome.storage.local.set(" + json.dumps(payload) + ", () => true)",
+                    cur_sw,
+                    "chrome.storage.local.set(" + json.dumps(payload) + ")",
                 )
-                log.info("handshake: token re-set after offscreen ready")
-                break
+                re_set += 1
             except Exception as exc:
-                log.warning("handshake: token re-set attempt %d failed: %s", attempt + 1, exc)
-                refreshed = _refresh_sw_ws()
-                if refreshed and refreshed != sw_ws:
-                    log.info("handshake: SW target changed for re-set %s -> %s", sw_ws, refreshed)
-                    sw_ws = refreshed
+                log.warning("handshake: token set (round %d) failed: %s", re_set, exc)
                 time.sleep(1.0)
+                continue
+            # 2. Give the SW a beat to create the offscreen document (which
+            #    opens the presence-WS on token_updated).
+            time.sleep(2.0)
+        log.warning("handshake: presence-WS did not connect within %ds", int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90")))
+
 
     def _find_target_ws(self, inst: Instance, kind: str, ext_id: str) -> str | None:
         """Return the webSocketDebuggerUrl of a live SW/background target.
