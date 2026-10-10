@@ -12,13 +12,22 @@ dist/
 # Local dev/prod-only compose + overlay files (contain dev/prod URLs/tokens —
 # untracked on purpose; never commit). Grouped by prefix so future files match.
 docker-compose.dev*.yml
+docker-compose.dev*.yml.bak
 docker-compose.prod*.yml
 Dockerfile.dev*.yml
 Dockerfile.dev*
 Dockerfile.yandex-c266
 *.env
 .env*
+!.env.example
 Dockerfile.dev-daemon-overlay
+
+# Backups / temporal artifacts (never commit).
+*.bak_*
+*.bak
+
+# Unpacked dev CRX / extension dists staged by local test runs.
+.dev-ext-crx-*/
 
 # Local persist-profile bind dir (real Chrome profiles, never commit).
 .persist-sessions/

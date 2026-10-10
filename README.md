@@ -81,7 +81,7 @@ quota/retention for the persist dir — host-side cleanup owns that.
 |---|---|---|
 | `CEKI_PROVIDER_TOKEN` | — | **Required.** One-time browser token from your dashboard. |
 | `CEKI_PROVIDER_SCHEDULE_ID` | derived | Browser/schedule ID. Usually derived from `/api/browser/me`; set it explicitly to pin the schedule. |
-| `CEKI_PROVIDER_BROWSER` | `chromium` | Browser flavor: `chromium` (Playwright Chromium), `yandex` (real Yandex Browser corporate build), `pseudo-yandex` (Chromium with a YaBrowser UA). |
+| `CEKI_PROVIDER_BROWSER` | `chromium` | Browser flavor: `chromium` (system Chromium), `yandex` (real Yandex Browser corporate build), `pseudo-yandex` (Chromium with a per-page YaBrowser UA). |
 | `CEKI_PROVIDER_VIEWPORT` | `1920x1080` | Browser viewport / resolution (WxH). Full HD by default; drives both the Chromium viewport and the Xvfb screen. |
 | `CEKI_PROVIDER_EXT_DIR` | `/opt/ceki/extension` | Path to the unpacked extension dist (used by the bundled `--load-extension` fallback). |
 | `CEKI_PROVIDER_LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` (also set by `--verbose`). |
