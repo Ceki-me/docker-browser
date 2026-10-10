@@ -201,6 +201,27 @@ class ProxySpec:
 
 
 @dataclass
+class ProxyGeo:
+    """Geo of the outbound proxy egress (resolved THROUGH the proxy).
+
+    Populated once at startup from a geo-IP endpoint dialed via the proxy, so
+    the browser-side fingerprint (extension) and the container TZ can match
+    what the rented browser's public IP actually advertises — instead of the
+    hardcoded West-European defaults in the extension.
+    """
+    country_code: str
+    country: str
+    timezone: str
+    latitude: float
+    longitude: float
+    locale: str | None = None
+
+    @property
+    def coords(self) -> tuple[float, float]:
+        return (self.latitude, self.longitude)
+
+
+@dataclass
 class DaemonConfig:
     token: str
     schedule_id: int | None
@@ -222,6 +243,7 @@ class DaemonConfig:
     displays: list[int] = field(default_factory=list)
     local_ws_url: str = ""
     proxy: ProxySpec | None = None
+    geo: ProxyGeo | None = None  # egress geo of the outbound proxy (best-effort)
 
     @property
     def relay_url(self) -> str:
@@ -350,6 +372,77 @@ def _proxy_url_with_creds(proxy: ProxySpec | None) -> str | None:
     return f"{proxy.scheme}://{netloc}"
 
 
+_GEO_CACHE: ProxyGeo | None = None
+_GEO_CACHE_TS = 0.0
+_GEO_TTL_S = 6 * 3600
+
+# IANA tz → BCP-47 locale for the countries we can plausibly see behind a
+# commercial proxy. Matches the extension's own LOCALES/ACCEPT_LANGUAGE_MAP
+# idea: locale + accept-language should agree with the egress country.
+_COUNTRY_LOCALE: dict[str, str | None] = {
+    "RU": "ru-RU", "UA": "uk-UA", "BY": "be-BY", "KZ": "kk-KZ",
+    "DE": "de-DE", "FR": "fr-FR", "ES": "es-ES", "IT": "it-IT",
+    "NL": "nl-NL", "BE": "nl-BE", "PL": "pl-PL", "PT": "pt-PT",
+    "SE": "sv-SE", "NO": "nb-NO", "DK": "da-DK", "FI": "fi-FI",
+    "CZ": "cs-CZ", "SK": "sk-SK", "RO": "ro-RO", "BG": "bg-BG",
+    "HU": "hu-HU", "GR": "el-GR", "AT": "de-AT", "CH": "de-CH",
+    "GB": "en-GB", "US": "en-US", "CA": "en-CA",
+}
+
+
+def _proxy_geo(proxy: ProxySpec | None) -> ProxyGeo | None:
+    """Resolve the outbound proxy's egress geo by dialing ipwho.is THROUGH it.
+
+    Best-effort: any failure returns None (caller keeps existing defaults: TZ
+    from env, extension's hardcoded West-Europe fingerprint). Cached for
+    ``_GEO_TTL_S`` so the daemon does not hammer the geo service on reconnects.
+
+    The request goes through the SAME proxy the rented browsers use, so the
+    answer describes the IP those browsers will present to sites — the whole
+    point of aligning browser-side geo with the rented identity.
+    """
+    global _GEO_CACHE, _GEO_CACHE_TS
+    if _GEO_CACHE is not None and (time.time() - _GEO_CACHE_TS) < _GEO_TTL_S:
+        return _GEO_CACHE
+    if proxy is None:
+        return None
+    proxy_url = _proxy_url_with_creds(proxy)
+    if not proxy_url:
+        return None
+    try:
+        import httpx
+        with httpx.Client(proxy=proxy_url, timeout=10) as client:
+            resp = client.get("https://ipwho.is/")
+        resp.raise_for_status()
+        data = resp.json()
+        cc = str(data.get("country_code") or "").upper()
+        # ipwho.is returns "timezone" as an OBJECT ({id, abbr, offset, ...}),
+        # not a plain IANA string — normalize to the IANA id so the value that
+        # reaches the backend/extension is "Europe/Moscow", not a shell-style
+        # dict repr that trips JSON/YaBrowser consumers.
+        tz_raw = data.get("timezone") or ""
+        tz = str(tz_raw.get("id") if isinstance(tz_raw, dict) else tz_raw).strip()
+        if not cc or not tz or not data.get("latitude") or not data.get("longitude"):
+            raise ValueError(f"ipwho.is missing geo fields: {data.get('success')}")
+        _GEO_CACHE = ProxyGeo(
+            country_code=cc,
+            country=str(data.get("country") or cc),
+            timezone=tz,
+            latitude=float(data["latitude"]),
+            longitude=float(data["longitude"]),
+            locale=_COUNTRY_LOCALE.get(cc),
+        )
+        _GEO_CACHE_TS = time.time()
+        log.info(
+            "daemon: proxy egress geo -> %s %s (%s, %.2f, %.2f)",
+            cc, tz, _GEO_CACHE.locale, _GEO_CACHE.latitude, _GEO_CACHE.longitude,
+        )
+        return _GEO_CACHE
+    except Exception as exc:
+        log.warning("daemon: proxy geo lookup failed: %s", exc)
+        return None
+
+
 def load_config() -> DaemonConfig:
     token = (
         os.environ.get("CEKI_PROVIDER_TOKEN")
@@ -420,6 +513,10 @@ def load_config() -> DaemonConfig:
         displays=list(range(display_start, display_start + max(1, max_sessions))),
         proxy=_proxy_from_env(),
     )
+    # Resolve the egress geo for the outbound proxy (if any) so the extension's
+    # fingerprint + container TZ can match what sites see. Non-fatal: a failure
+    # keeps the previous defaults.
+    cfg.geo = _proxy_geo(cfg.proxy)
     cfg.local_ws_url = f"ws://127.0.0.1:{cfg.daemon_port}"
     return cfg
 
@@ -1198,6 +1295,19 @@ class SpawnManager:
                 "username": self.cfg.proxy.username,
                 "password": self.cfg.proxy.password,
             }
+        # Egress geo of the outbound proxy (if resolved): lets the extension
+        # build its fingerprint (timezone / locale / geolocation) from the geo
+        # the rented browser actually advertises, instead of the hardcoded
+        # West-European defaults. Absent when no proxy or the lookup failed.
+        if self.cfg.geo:
+            payload["ceki_geo"] = {
+                "country_code": self.cfg.geo.country_code,
+                "country": self.cfg.geo.country,
+                "timezone": self.cfg.geo.timezone,
+                "latitude": self.cfg.geo.latitude,
+                "longitude": self.cfg.geo.longitude,
+                "locale": self.cfg.geo.locale,
+            }
         expr = (
             "(async () => {"
             "const keys = Object.keys(" + ui_seed_json + ");"
@@ -1580,6 +1690,26 @@ class ProviderWsClient:
     def relay_url(self) -> str:
         return self.cfg.relay_url
 
+    def _welcome_geo(self) -> dict | None:
+        """Geo block advertised in ``welcome`` for the relay → backend flow.
+
+        Carries the outbound proxy's egress geo (country/timezone/coords) so
+        the backend can store it on the schedule even when it does not or
+        cannot geo-resolve the provider's client_ip (e.g. WS dialed through a
+        proxy that shields its egress). Absent when no proxy geo is known.
+        """
+        g = self.cfg.geo
+        if g is None:
+            return None
+        return {
+            "country_code": g.country_code,
+            "country": g.country,
+            "timezone": g.timezone,
+            "latitude": g.latitude,
+            "longitude": g.longitude,
+            "locale": g.locale,
+        }
+
     async def send(self, msg: dict | str) -> None:
         ws = self.ws
         if ws is None or ws.state != 1:  # OPEN
@@ -1712,6 +1842,13 @@ class ProviderWsClient:
         import time as _time
         while not self._stop:
             try:
+                # NOTE: dialing the relay THROUGH the outbound proxy would make
+                # the relay's client_ip == proxy egress IP, so the backend could
+                # geo-resolve the schedule purely by IP. websockets.connect()
+                # does not support an HTTP proxy for ws:// (no proxy= kwarg in
+                # 13.1), so the provider's egress geo is instead carried
+                # explicitly in the welcome message (see _welcome_geo) and
+                # forwarded to the backend as client_geo in the 'online' event.
                 async with websockets.connect(
                     self.relay_url,
                     subprotocols=[f"bearer.{self.cfg.token}"],
@@ -1728,6 +1865,7 @@ class ProviderWsClient:
                         "browser_flavor": provider_browser_flavor(),
                         "browser_name": provider_browser_name(),
                         "active_session_id": self.router.active_session_id(),
+                        "geo": self._welcome_geo(),
                     })
                     # Concurrent message handling: a dedicated reader task
                     # decodes frames off the relay socket into an unbounded
@@ -2025,6 +2163,18 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
     cfg = load_config()
+    # If the operator did not pin TZ, adopt the outbound proxy's egress
+    # timezone so the browsers we spawn report a local time consistent with the
+    # geo their public IP advertises (entrypoint mirrors this via /etc/timezone
+    # fallback when there is no proxy; daemon-side override wins when the proxy
+    # geo is known).
+    if not os.environ.get("TZ") and cfg.geo and cfg.geo.timezone:
+        os.environ["TZ"] = cfg.geo.timezone
+        try:
+            time.tzset()
+        except Exception:
+            pass
+        log.info("daemon: adopted proxy egress TZ=%s", cfg.geo.timezone)
     log.info(
         "daemon: schedule=%s sessions=%d cdp_pool=%s..%s displays=%s..%s storage_key=%s persist=%s",
         cfg.schedule_id,
