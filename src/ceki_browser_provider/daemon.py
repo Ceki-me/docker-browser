@@ -885,12 +885,14 @@ class SpawnManager:
             # Chrome; fixing Yandex adoption is the current task).
             log.info("daemon: rental proxy applied by extension -> %s", self.cfg.proxy.server_url)
         args.append(f"--window-size={self.cfg.width},{self.cfg.height}")
-        if _pseudo_yandex_enabled():
-            # pseudo-yandex: launch-level YaBrowser UA. Page-level CDP override
-            # conflicts with the extension's chrome.debugger session on system
-            # Chromium 154 (SW CDP answers 500 and the rent dies) — this is the
-            # only path that survives the handshake.
-            args.append("--user-agent=" + provider_app._PSEUDO_UA)
+        # pseudo-yandex: the YaBrowser UA is delivered by the EXTENSION via
+        # JS injection (Page.addScriptToEvaluateOnNewDocument, key
+        # ceki_pseudo_ua seeded in storage), NOT via --user-agent at launch.
+        # Verified on system Chromium 154: a launcher-level --user-agent makes
+        # the extension's SW CDP target answer HTTP 500, so the daemon could
+        # never complete the storage handshake and every rent died (offline:
+        # black screen, watchdog reap). JS injection survives because it does
+        # not touch the Network domain and does not disturb the SW.
         args.append(f"--user-data-dir={inst.profile_dir}")
         args.append(f"--disk-cache-dir={inst.profile_dir}/cache")
         args.append(f"--remote-debugging-port={inst.cdp_port}")
@@ -1307,6 +1309,19 @@ class SpawnManager:
                 "latitude": self.cfg.geo.latitude,
                 "longitude": self.cfg.geo.longitude,
                 "locale": self.cfg.geo.locale,
+            }
+        # pseudo-yandex: the YaBrowser UA string is consumed by the extension's
+        # fingerprint inject (navigator.userAgent/userAgentData JS override).
+        # Seeding it here (instead of --user-agent at launch) keeps the SW CDP
+        # target healthy on system Chromium 154 — see _build_chrome_args.
+        if _pseudo_yandex_enabled():
+            payload["ceki_pseudo_ua"] = {
+                "userAgent": provider_app._PSEUDO_UA,
+                "brands": [
+                    {"brand": "Not A(Brand", "version": "99.0.0.0"},
+                    {"brand": "Yandex", "version": f"{provider_app._PSEUDO_YABROWSER_MAJOR}.{provider_app._PSEUDO_YABROWSER_MINOR}.0.0"},
+                    {"brand": "Chromium", "version": provider_app._PSEUDO_UA_CHROMIUM_MAJOR},
+                ],
             }
         expr = (
             "(async () => {"
