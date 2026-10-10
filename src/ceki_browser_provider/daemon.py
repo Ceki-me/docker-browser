@@ -251,17 +251,7 @@ def _schedule_max_sessions(api_base: str, token: str, schedule_id: int | None) -
         # the proxy egress IP and can assign the right geo to this schedule.
         # Without a proxy configured this is a direct call (unchanged).
         _proxy = _proxy_from_env()
-        _proxy_url = None
-        if _proxy:
-            # Embed credentials in the proxy URL: httpx sends Proxy-Authorization
-            # from the URL userinfo (a bare host:port without creds → 407).
-            _netloc = _proxy.host
-            if _proxy.port:
-                _netloc += f":{_proxy.port}"
-            if _proxy.username:
-                from urllib.parse import quote
-                _netloc = f"{quote(_proxy.username, safe='')}:{quote(_proxy.password or '', safe='')}@{_netloc}"
-            _proxy_url = f"{_proxy.scheme}://{_netloc}"
+        _proxy_url = _proxy_url_with_creds(_proxy)
         _client = httpx.Client(proxy=_proxy_url, timeout=15)
         try:
             resp = _client.get(
@@ -345,6 +335,19 @@ def _proxy_from_env() -> ProxySpec | None:
         username=os.environ.get("CEKI_PROXY_USERNAME") or None,
         password=os.environ.get("CEKI_PROXY_PASSWORD") or None,
     )
+
+
+def _proxy_url_with_creds(proxy: ProxySpec | None) -> str | None:
+    """Proxy URL with credentials embedded (httpx/websockets need userinfo)."""
+    if proxy is None:
+        return None
+    netloc = proxy.host
+    if proxy.port:
+        netloc += f":{proxy.port}"
+    if proxy.username:
+        from urllib.parse import quote
+        netloc = f"{quote(proxy.username, safe='')}:{quote(proxy.password or '', safe='')}@{netloc}"
+    return f"{proxy.scheme}://{netloc}"
 
 
 def load_config() -> DaemonConfig:
