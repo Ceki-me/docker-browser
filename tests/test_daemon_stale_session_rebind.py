@@ -166,15 +166,15 @@ class TestMatchWsSkipsStaleInstance:
         assert matched is None, "must not bind to a stale instance"
         assert stale.ws is None
 
-    def test_ready_instance_is_never_skipped(self):
-        """Fix 2 must not break reconnect for a connected (ready) instance."""
+    def test_closed_ready_instance_is_rebindable(self):
+        """A ready instance whose ws has CLOSED is a legitimate reconnect target."""
         spawner = make_spawner()
-        ready = seed_instance(spawner, "ready", ready=True, ws_state=1)  # OPEN
+        ready = seed_instance(spawner, "ready", ready=True, ws_state=3)  # CLOSED
         ws = MagicMock()
 
         matched = spawner.match_ws(ws)
 
-        assert matched is ready, "ready instance with a live WS must be rebindable"
+        assert matched is ready, "ready instance with a closed WS must be rebindable"
 
     def test_by_session_id_binds_exact_instance(self):
         """When the extension sends ?session_id=, it must bind to that exact instance."""
@@ -210,6 +210,42 @@ class TestMatchWsSkipsStaleInstance:
 
         assert matched is fresh, "live instance must keep its WS; fresh is the target"
         assert live.ws is not ws, "open WS must not be stolen"
+
+    def test_double_connect_by_session_id_is_refused(self):
+        """A second bind with a live WS on the same session must be refused
+        (double-connect strands the old handler)."""
+        spawner = make_spawner(connect_timeout="30")
+        inst = seed_instance(spawner, "dup", ready=True, ws_state=1)  # live WS
+        old_ws = inst.ws
+        new_ws = MagicMock()
+
+        matched = spawner.match_ws(new_ws, session_id="dup")
+
+        assert matched is None, "duplicate bind to a live session must be refused"
+        assert inst.ws is old_ws, "existing live ws must be kept"
+
+    def test_second_bind_with_dead_ws_is_allowed(self):
+        """A new bind IS allowed once the old ws is CLOSED (reconnect)."""
+        spawner = make_spawner(connect_timeout="30")
+        inst = seed_instance(spawner, "recon", ready=True, ws_state=3)  # CLOSED
+        new_ws = MagicMock()
+
+        matched = spawner.match_ws(new_ws, session_id="recon")
+
+        assert matched is inst, "reconnect over a closed ws must succeed"
+        assert inst.ws is new_ws
+
+    def test_double_connect_overwrite_guard(self):
+        """Overwrite (single instance) must refuse while the only ws is OPEN."""
+        spawner = make_spawner(connect_timeout="30")
+        inst = seed_instance(spawner, "only", ready=True, ws_state=1)
+        old_ws = inst.ws
+        new_ws = MagicMock()
+
+        matched = spawner.match_ws(new_ws)  # no session_id → overwrite path
+
+        assert matched is None, "overwrite must not replace a live ws"
+        assert inst.ws is old_ws
 
 
 class TestBootSlotResetsOnIdle:

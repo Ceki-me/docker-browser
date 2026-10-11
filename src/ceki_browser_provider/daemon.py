@@ -803,6 +803,20 @@ class SpawnManager:
             if session_id:
                 inst = self._instances.get(session_id)
                 if inst is not None:
+                    # Reconnect vs double-connect: if this instance ALREADY has
+                    # a live presence-WS, a second bind is a duplicate socket
+                    # from the same extension/SW — replacing it strands the old
+                    # handler (its read loop stays alive but is no longer the
+                    # owner → the old socket is never torn down and messages
+                    # double-route). Only rebind when the existing WS is dead
+                    # (None / CLOSED). Refuse the new socket otherwise; the
+                    # caller closes it.
+                    if inst.ws is not None and getattr(inst.ws, "state", 3) == 1:
+                        log.info(
+                            "match_ws: session %s already has a live WS — refusing duplicate bind",
+                            inst.session_id,
+                        )
+                        return None
                     inst.ws = ws
                     inst.ready = True
                     log.info("match_ws: by session_id %s -> inst %s", session_id, inst.session_id)
@@ -829,9 +843,16 @@ class SpawnManager:
                     inst.ready = True
                     log.info("match_ws: first-free bind -> inst %s (query sid=%s)", inst.session_id, session_id)
                     return inst
-            # Overwrite: rebind the only instance (reconnect).
+            # Overwrite: rebind the only instance (reconnect). Same guard as the
+            # by-session path: never replace an OPEN ws (double-connect).
             if len(self._instances) == 1:
                 inst = next(iter(self._instances.values()))
+                if inst.ws is not None and getattr(inst.ws, "state", 3) == 1:
+                    log.info(
+                        "match_ws: only session %s already has a live WS — refusing duplicate bind",
+                        inst.session_id,
+                    )
+                    return None
                 if inst.ws is None and not inst.ready:
                     age = time.time() - inst.created_at
                     if age > self._connect_timeout_soft():
