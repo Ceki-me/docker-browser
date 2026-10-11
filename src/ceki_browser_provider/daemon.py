@@ -641,8 +641,15 @@ class SpawnManager:
         Mirrors the watchdog's CEKI_DAEMON_CONNECT_TIMEOUT: once a spawn has had
         this long to get its extension's presence-WS up and has not, treat it as
         dead so match_ws() does not park the next rent's extension on it.
+
+        Default is 35s (NOT 90): the relay gives a rent roughly 40s before it
+        sends session_ended / times the connect out. Waiting the full 90s in
+        _retry_token_after_offscreen means the relay kills the rent first and
+        the daemon is still spinning — every 0-connect session we saw in live
+        e2e had exactly this shape (daemon waiting, relay already gone). The
+        daemon must reap/relaunch BEFORE the relay does.
         """
-        return float(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90"))
+        return float(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "35"))
 
     def ensure(self, session_id: str, params: dict) -> Instance | None:
         """Return the live instance for ``session_id`` or spawn one.
@@ -1449,7 +1456,7 @@ class SpawnManager:
         write (or re-write) the token + relay config, then poll for the offscreen
         CDP target and finally wait for presence-WS — no removes.
         """
-        deadline = time.time() + int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90"))
+        deadline = time.time() + self._connect_timeout_soft()
         # 1. Ensure the token/config is set (idempotent — re-set refreshes the
         #    storage.onChanged trigger without tearing the SW down).
         re_set = 0
@@ -1479,7 +1486,7 @@ class SpawnManager:
             # 2. Give the SW a beat to create the offscreen document (which
             #    opens the presence-WS on token_updated).
             time.sleep(2.0)
-        log.warning("handshake: presence-WS did not connect within %ds", int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90")))
+        log.warning("handshake: presence-WS did not connect within %.0fs", self._connect_timeout_soft())
 
 
     def _find_target_ws(self, inst: Instance, kind: str, ext_id: str) -> str | None:
@@ -2206,7 +2213,7 @@ class Daemon:
         Periodically reap instances that are older than the connect timeout and
         still not ``ready``.
         """
-        connect_timeout = int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90"))
+        connect_timeout = int(self.spawner._connect_timeout_soft())
         while True:
             await asyncio.sleep(5)
             for session_id, inst in self.spawner.active().items():
