@@ -92,6 +92,40 @@ class TestDeliverSessionEndedDestroysUnconnectedInstance:
         )
         assert spy.called
 
+    @pytest.mark.asyncio
+    async def test_session_kill_before_connect_destroys_instance(self):
+        """session.kill (backend reaper) must also destroy an unconnected instance."""
+        from ceki_browser_provider.daemon import ProviderWsClient
+
+        spawner = make_spawner()
+        seed_instance(spawner, "killed-session")
+        daemon = ProviderWsClient(spawner.cfg, spawner, MagicMock())
+
+        with patch.object(spawner, "destroy", wraps=spawner.destroy) as spy:
+            await daemon._deliver("killed-session", {"type": "session.kill", "session_id": "killed-session"})
+
+        assert "killed-session" not in spawner._instances
+        assert spy.called
+
+    @pytest.mark.asyncio
+    async def test_connected_session_ended_still_destroys(self):
+        """Connected sessions keep the normal destroy-on-ended path (no regression)."""
+        from ceki_browser_provider.daemon import ProviderWsClient
+
+        spawner = make_spawner()
+        ws = AsyncMock()
+        ws.state = 1  # OPEN
+        inst = seed_instance(spawner, "connected", ready=True, ws_state=1)
+        inst.ws = ws
+        daemon = ProviderWsClient(spawner.cfg, spawner, MagicMock())
+
+        with patch.object(spawner, "destroy", wraps=spawner.destroy) as spy:
+            await daemon._deliver("connected", {"type": "session_ended", "session_id": "connected"})
+
+        assert ws.send.called, "ended must still be delivered to the connected extension"
+        assert "connected" not in spawner._instances, "connected session must also be destroyed"
+        assert spy.called
+
 
 class TestMatchWsSkipsStaleInstance:
     """Fix 2: match_ws first-free must not bind to a stale (connect-window-expired) instance."""
@@ -141,6 +175,41 @@ class TestMatchWsSkipsStaleInstance:
         matched = spawner.match_ws(ws)
 
         assert matched is ready, "ready instance with a live WS must be rebindable"
+
+    def test_by_session_id_binds_exact_instance(self):
+        """When the extension sends ?session_id=, it must bind to that exact instance."""
+        spawner = make_spawner(connect_timeout="30")
+        stale = seed_instance(spawner, "stale", age=120.0)  # stale, would be skipped
+        target = seed_instance(spawner, "target", age=5.0)
+        ws = MagicMock()
+
+        matched = spawner.match_ws(ws, session_id="target")
+
+        assert matched is target, "explicit session_id must win over stale-skipping"
+        assert stale.ws is None
+        assert target.ws is ws
+
+    def test_by_session_id_without_stale_skips_unknown(self):
+        """An explicit session_id for a non-existent session falls through to first-free."""
+        spawner = make_spawner(connect_timeout="30")
+        fresh = seed_instance(spawner, "fresh", age=5.0)
+        ws = MagicMock()
+
+        matched = spawner.match_ws(ws, session_id="does-not-exist")
+
+        assert matched is fresh, "unknown explicit sid should fall back to first-free"
+
+    def test_live_ws_instance_is_not_stolen_by_first_free(self):
+        """first-free must NOT rebind an instance that has a live (OPEN) ws."""
+        spawner = make_spawner(connect_timeout="30")
+        live = seed_instance(spawner, "live", ready=True, ws_state=1)
+        fresh = seed_instance(spawner, "fresh", age=5.0)
+        ws = MagicMock()
+
+        matched = spawner.match_ws(ws)
+
+        assert matched is fresh, "live instance must keep its WS; fresh is the target"
+        assert live.ws is not ws, "open WS must not be stolen"
 
 
 class TestBootSlotResetsOnIdle:
