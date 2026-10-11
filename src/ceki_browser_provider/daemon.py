@@ -634,6 +634,16 @@ class SpawnManager:
         with self._lock:
             return dict(self._instances)
 
+    @staticmethod
+    def _connect_timeout_soft() -> float:
+        """Seconds after which a spawned-but-unconnected instance is considered stale.
+
+        Mirrors the watchdog's CEKI_DAEMON_CONNECT_TIMEOUT: once a spawn has had
+        this long to get its extension's presence-WS up and has not, treat it as
+        dead so match_ws() does not park the next rent's extension on it.
+        """
+        return float(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90"))
+
     def ensure(self, session_id: str, params: dict) -> Instance | None:
         """Return the live instance for ``session_id`` or spawn one.
 
@@ -788,6 +798,21 @@ class SpawnManager:
                 log.info("match_ws: session_id %s not in active instances (%s)", session_id, list(self._instances))
             for inst in self._instances.values():
                 if inst.ws is None or inst.ws.state == 3:  # CLOSED
+                    # Only rebind an instance that is still waiting for its
+                    # extension (recently spawned, not ready). A dead instance
+                    # whose session ended while spawning (see _deliver
+                    # session.ended path) still sits here holding a free slot;
+                    # binding the NEXT rent's extension to it would strand the
+                    # new rent (stale-session rebind bug). Skip anything whose
+                    # extension-connect window has already expired.
+                    if inst.ws is None and not inst.ready:
+                        age = time.time() - inst.created_at
+                        if age > self._connect_timeout_soft():
+                            log.info(
+                                "match_ws: skip stale instance %s (age %.0fs, waiting for ext)",
+                                inst.session_id, age,
+                            )
+                            continue
                     inst.ws = ws
                     inst.ready = True
                     log.info("match_ws: first-free bind -> inst %s (query sid=%s)", inst.session_id, session_id)
@@ -795,6 +820,14 @@ class SpawnManager:
             # Overwrite: rebind the only instance (reconnect).
             if len(self._instances) == 1:
                 inst = next(iter(self._instances.values()))
+                if inst.ws is None and not inst.ready:
+                    age = time.time() - inst.created_at
+                    if age > self._connect_timeout_soft():
+                        log.info(
+                            "match_ws: skip stale only instance %s (age %.0fs, waiting for ext)",
+                            inst.session_id, age,
+                        )
+                        return None
                 inst.ws = ws
                 inst.ready = True
                 log.info("match_ws: overwrite-> inst %s (query sid=%s)", inst.session_id, session_id)
@@ -1819,6 +1852,22 @@ class ProviderWsClient:
                 log.warning(
                     "relay -> %s: instance %s not connected yet, dropping",
                     msg.get("type"), session_id,
+                )
+            if msg.get("type") in ("session_ended", "session.kill"):
+                # Relay closed the session before the extension connected
+                # (renter stop during spawn / backend reaper). The instance is
+                # dead — drop it NOW so it doesn't hold its CDP/display slot
+                # and, worse, doesn't attract a later extension via
+                # match_ws() "first-free" bind (stale-session rebind bug:
+                # rent#N+1's extension can bind to this dead instance and the
+                # new rent never gets an extension → relay times it out).
+                log.info(
+                    "relay -> %s: destroying %s (extension never connected)",
+                    msg.get("type"), session_id,
+                )
+                await asyncio.to_thread(
+                    self.spawner.destroy, session_id,
+                    "ended" if msg.get("type") == "session_ended" else "crashed",
                 )
             return
         try:
