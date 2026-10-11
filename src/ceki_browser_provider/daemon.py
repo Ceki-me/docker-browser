@@ -1189,6 +1189,20 @@ class SpawnManager:
         ws = getattr(inst, "ws", None)
         ws_open = ws is not None and getattr(ws, "state", None) == 1
         if not ws_open:
+            # The relay may have already closed this session while we were
+            # handshaking (session_ended → _deliver destroyed the instance).
+            # Relaunching a dead session occupies a display/CDP slot and races
+            # the next rent's spawn (live e2e: a destroyed session's Xvfb was
+            # relaunched at the same instant the next session spawned, both
+            # fell over). Only relaunch when the instance is still ours.
+            with self._lock:
+                still_alive = self._instances.get(inst.session_id) is inst
+            if not still_alive:
+                log.warning(
+                    "handshake: session %s destroyed while handshaking — skipping relaunch",
+                    inst.session_id,
+                )
+                return
             log.warning("handshake: presence-WS not connected after handshake, relaunching run-phase Chrome once")
             # Recreate BOTH Xvfb and Chrome: the first Xvfb may already be dead
             # (live e2e: ConnectionRefusedError 111 on the CDP port because the
