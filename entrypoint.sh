@@ -12,6 +12,12 @@
 
 set -e
 
+# Chrome (esp. for Testing) opens hundreds of file descriptors across its
+# renderer/utility processes; the docker default soft limit (1024) is a common
+# cause of "CDP port ConnectionRefused" after many subprocesses. Raise it for
+# the whole provider process tree (hard limit 524288 allows this).
+ulimit -n 65536 2>/dev/null || true
+
 # Inherit a non-UTC timezone so the provider browser matches the IP geolocation.
 # Priority: TZ env (compose passes ${TZ:-}) → /etc/timezone.
 if [ -z "${TZ:-}" ] && [ -f /etc/timezone ]; then
@@ -37,6 +43,12 @@ DEFAULT_API_URL="https://api.ceki.me"
 # Stable extension id (derived from the public manifest key). Used for the
 # external-update policy file Chrome reads at start.
 EXT_ID="gfionhbdkojjnjpbhlblopoaecdpllhb"
+
+# Download temp dir for Browser.setDownloadBehavior (both chromium and
+# yandex images). The extension points its per-session downloads here; Chrome
+# /Yandex silently refuse to start a download if the target directory does
+# not exist, so create it once at container start.
+mkdir -p /tmp/ceki-dl && chmod 1777 /tmp/ceki-dl
 
 # --- External-extension policy -------------------------------------------------
 # Chrome installs and auto-updates the extension itself from an update channel

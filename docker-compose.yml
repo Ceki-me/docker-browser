@@ -1,29 +1,95 @@
-# Docker-compose reference for the ceki headless-browser provider.
-# Token is required at runtime (never commit it here).
+# Docker-compose for the ceki headless-browser provider — daemon mode.
 #
-# IMPORTANT: run ./build.sh first — it stages the browser-extension dist into
-# the git-ignored extension/ directory. The Dockerfile's `COPY extension/`
-# step fails if that directory is missing, so `up --build` on a fresh clone
-# requires build.sh to have run beforehand.
+# Brings up BOTH browser flavors, each as its own provider daemon:
+#   * pseudo-yandex — system Chromium with a per-page YaBrowser UA
+#                     (Dockerfile.pseudo-yandex)
+#   * chromium      — plain system Chromium (Dockerfile)
 #
-#   ./build.sh                        # stage extension dist (required before --build)
+# Every setting is parameterized through the shell environment / .env file —
+# tokens, relay/API endpoints, proxy, and per-daemon slot allocation. The
+# bundled extension dist is staged by ./build.sh into extension/ (git-ignored);
+# `up --build` rebuilds each image from this repo's code + staged extension.
+#
+# Required before first `docker compose up --build`:
+#   ./build.sh                       # stage the extension dist (required)
+#   cp .env.example .env              # then fill CEKI_PROVIDER_TOKEN_* and
+#                                     # relay/api endpoints (defaults are public)
+#
+# Bring up everything:
 #   docker compose up --build -d
-#   docker compose logs -f provider
-#   docker compose stop provider
+# Bring up a single flavor:
+#   docker compose up --build -d pseudo-yandex
+#   docker compose up --build -d chromium
+# Watch logs:
+#   docker compose logs -f pseudo-yandex chromium
+#
+# Token picks: each provider needs its OWN one-time token (per schedule).
+
+x-provider-defaults: &provider-defaults
+  ipc: host
+  shm_size: 1gb
+  restart: unless-stopped
 
 services:
-  provider:
+  # ── plain Chromium provider ───────────────────────────────────────────────
+  chromium:
+    <<: *provider-defaults
     build:
       context: .
       dockerfile: Dockerfile
-    image: ceki/provider:latest
+    image: ceki/provider:chromium
+    container_name: ceki-provider-dev-chromium
     environment:
-      # REQUIRED: the one-time browser token from your account dashboard.
-      # The container starts and stops with a clear error if this is unset.
-      - CEKI_PROVIDER_TOKEN=${CEKI_PROVIDER_TOKEN:-}
-      # Inherit the host timezone so the provider browser's local time matches
-      # the IP geolocation (self-fingerprint consistency).
-      - TZ=${TZ:-}
-      - DISPLAY=:99
-    # One provider browser per container. Scale to run more (each needs its own token).
-    restart: unless-stopped
+      # REQUIRED: one-time token + schedule id for THIS provider.
+      CEKI_PROVIDER_TOKEN: ${CEKI_PROVIDER_TOKEN_CHROMIUM:?set CEKI_PROVIDER_TOKEN_CHROMIUM in .env}
+      CEKI_PROVIDER_SCHEDULE_ID: ${CEKI_PROVIDER_SCHEDULE_ID_CHROMIUM:-}
+      CEKI_PROVIDER_BROWSER: chromium
+      # daemon mode: one provider-WS per schedule, one Chrome per match
+      CEKI_DAEMON: "1"
+      # base X display for this provider's own window (idle); rent displays come
+      # from the DAEMON_DISPLAY_START pool below
+      DISPLAY: ${DISPLAY_CHROMIUM:-:98}
+      # ── endpoints (defaults are public; point to internal/dev stand via .env)
+      CEKI_WS_URL: ${CEKI_WS_URL:-wss://browser.ceki.me/ws/provider}
+      CEKI_API_URL: ${CEKI_API_URL:-https://api.ceki.me}
+      CEKI_PROVIDER_EXT_DIR: /opt/ceki/extension
+      CEKI_PROVIDER_LOG_LEVEL: ${CEKI_PROVIDER_LOG_LEVEL:-INFO}
+      # Skip external-extension policy → use unpacked patched copy (reliable
+      # relay_ws override in daemon mode, see README).
+      CEKI_EXT_SKIP_UPDATE: ${CEKI_EXT_SKIP_UPDATE:-1}
+      # ── multi-session slots (must NOT overlap between providers on one host;
+      #    chromium: CDP 9200+, X 121+; pseudo-yandex: CDP 9223+, X 101+)
+      CEKI_DAEMON_CDP_START: ${CEKI_DAEMON_CDP_START_CHROMIUM:-9200}
+      CEKI_DAEMON_DISPLAY_START: ${CEKI_DAEMON_DISPLAY_START_CHROMIUM:-121}
+      # ── outbound proxy (optional; empty = direct). Applied by the extension
+      #    via chrome.proxy.settings. Do NOT set HTTP_PROXY/HTTPS_PROXY here —
+      #    Chrome routes CDP/local WS through them and the rental dies.
+      CEKI_PROXY_URL: ${CEKI_PROXY_URL:-}
+      CEKI_PROXY_BYPASS_EXTRA: ${CEKI_PROXY_BYPASS_EXTRA:-}
+      TZ: ${TZ:-}
+
+  # ── pseudo-yandex provider ────────────────────────────────────────────────
+  pseudo-yandex:
+    <<: *provider-defaults
+    build:
+      context: .
+      dockerfile: Dockerfile.pseudo-yandex
+    image: ceki/provider:pseudo-yandex
+    container_name: ceki-provider-dev-pseudo-yandex
+    environment:
+      CEKI_PROVIDER_TOKEN: ${CEKI_PROVIDER_TOKEN_PSEUDO:?set CEKI_PROVIDER_TOKEN_PSEUDO in .env}
+      CEKI_PROVIDER_SCHEDULE_ID: ${CEKI_PROVIDER_SCHEDULE_ID_PSEUDO:-}
+      CEKI_PROVIDER_BROWSER: pseudo-yandex
+      CEKI_DAEMON: "1"
+      DISPLAY: ${DISPLAY_PSEUDO:-:99}
+      CEKI_WS_URL: ${CEKI_WS_URL:-wss://browser.ceki.me/ws/provider}
+      CEKI_API_URL: ${CEKI_API_URL:-https://api.ceki.me}
+      CEKI_PROVIDER_EXT_DIR: /opt/ceki/extension
+      CEKI_PROVIDER_LOG_LEVEL: ${CEKI_PROVIDER_LOG_LEVEL:-INFO}
+      CEKI_EXT_SKIP_UPDATE: ${CEKI_EXT_SKIP_UPDATE:-1}
+      # pseudo-yandex: launch-level YaBrowser UA + own rent slot pool
+      CEKI_DAEMON_CDP_START: ${CEKI_DAEMON_CDP_START_PSEUDO:-9223}
+      CEKI_DAEMON_DISPLAY_START: ${CEKI_DAEMON_DISPLAY_START_PSEUDO:-101}
+      CEKI_PROXY_URL: ${CEKI_PROXY_URL:-}
+      CEKI_PROXY_BYPASS_EXTRA: ${CEKI_PROXY_BYPASS_EXTRA:-}
+      TZ: ${TZ:-}

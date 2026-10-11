@@ -58,11 +58,13 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import websockets
 
 from ceki_browser_provider import app as provider_app
+from ceki_browser_provider import provider_debug
 
 log = logging.getLogger("ceki.provider.daemon")
 
@@ -87,6 +89,14 @@ _CHROME_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--lang=en-US",
     "--window-position=0,0",
+    # Chromium 150+ closes remote-debugging access to extension targets by
+    # default: /json/list still lists the extension SW, but WS-upgrade to it
+    # answers HTTP 500 and the token handshake dies (storage never lands, no
+    # presence-WS). These two switches re-open extension targets to the
+    # debugging port. Verified needed on system Chromium 154 (unbranded);
+    # Yandex corporate ignores them (it gates extension debugging elsewhere).
+    "--remote-debugging-allow-extension-targets",
+    "--enable-unsafe-extension-debugging",
     # Idle-rent memory/CPU: without these, Yandex opens ya.ru as the home
     # page plus its native chrome://wallpaper / alissenger-bubble surfaces —
     # ~5 renderer processes / ~1.9GB for an otherwise-blank rent. Keep the
@@ -101,6 +111,17 @@ _CHROME_ARGS = [
     "--disable-component-update",
     "--disable-background-mode",
     "--disable-features=AlessengerBubble,Wallpaper,DesktopBackgroundMode",
+    # Native download target. Without this Chromium writes downloads to the
+    # OS default dir (~/Downloads) with a temp name (.org.chromium.Chromium.*)
+    # and NEVER finalizes the real filename, so chrome.downloads sees only an
+    # in-progress item (poll never matches 'complete') and no
+    # Page.downloadWillBegin fires. With an explicit dir Chromium writes the
+    # file there under its final name and emits Page.downloadWillBegin/Progress,
+    # which the extension's DL transfer hooks onto. Cross-build: works on plain
+    # Chromium; Yandex ignores the flag but ALSO lacks the download events, so
+    # its transfer goes through the chrome.downloads poll (already supported).
+    # Dir is created by the container entrypoint (/tmp/ceki-dl, 1777).
+    "--download-default-directory=/tmp/ceki-dl",
 ]
 
 # Token handshake is performed over CDP directly against the extension
@@ -138,9 +159,67 @@ def provider_browser_name() -> str:
     return _FLAVOR_NAMES.get(provider_browser_flavor(), "Chrome")
 
 
+def _pseudo_yandex_enabled() -> bool:
+    """True when the daemon must serve the YaBrowser UA on rent pages.
+
+    Only the pseudo-yandex flavor enables the spoof. Real yandex ships the UA
+    natively. The flavor reports ``yandex`` (same alias), so we must compare
+    the raw env value, not ``provider_browser_flavor()``.
+    """
+    return os.environ.get("CEKI_PROVIDER_BROWSER", "chromium").strip().lower() == "pseudo-yandex"
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
+@dataclass
+class ProxySpec:
+    """Outbound proxy applied to every rental browser (from container env)."""
+    scheme: str  # 'http' | 'socks5'
+    host: str
+    port: int
+    username: str | None = None
+    password: str | None = None
+    bypass_extra: tuple[str, ...] = ()
+
+    @property
+    def server_url(self) -> str:
+        """--proxy-server value. Credentials are NOT inlined here: Chrome CLI
+        rejects user:pass in the flag; auth is answered by the extension via
+        webRequest.onAuthRequired instead."""
+        return f"{self.scheme}://{self.host}:{self.port}"
+
+    @property
+    def bypass_list(self) -> list[str]:
+        """Chrome proxy bypass list. Base entries never route through the
+        proxy; ``CEKI_PROXY_BYPASS_EXTRA`` (space- or comma-separated) appends
+        operator entries (e.g. internal hosts) without hard-coding them here."""
+        base = ["<local>", "localhost", "127.0.0.1", "::1", "*.ceki.me", "*.ceki.com"]
+        extra = [e.strip() for e in os.environ.get("CEKI_PROXY_BYPASS_EXTRA", "").replace("\n", " ").split() if e.strip()]
+        return base + extra
+
+
+@dataclass
+class ProxyGeo:
+    """Geo of the outbound proxy egress (resolved THROUGH the proxy).
+
+    Populated once at startup from a geo-IP endpoint dialed via the proxy, so
+    the browser-side fingerprint (extension) and the container TZ can match
+    what the rented browser's public IP actually advertises — instead of the
+    hardcoded West-European defaults in the extension.
+    """
+    country_code: str
+    country: str
+    timezone: str
+    latitude: float
+    longitude: float
+    locale: str | None = None
+
+    @property
+    def coords(self) -> tuple[float, float]:
+        return (self.latitude, self.longitude)
+
 
 @dataclass
 class DaemonConfig:
@@ -163,6 +242,8 @@ class DaemonConfig:
     cdps: list[int] = field(default_factory=list)
     displays: list[int] = field(default_factory=list)
     local_ws_url: str = ""
+    proxy: ProxySpec | None = None
+    geo: ProxyGeo | None = None  # egress geo of the outbound proxy (best-effort)
 
     @property
     def relay_url(self) -> str:
@@ -176,6 +257,190 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if v is None:
         return default
     return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _schedule_max_sessions(api_base: str, token: str, schedule_id: int | None) -> int:
+    """Best-effort: read the schedule's multi-session capacity from the backend.
+
+    Fetches /api/browser/me (the same card the extension pulls on connect) and
+    returns ``settings.max_sessions`` when the schedule advertises
+    multi_sessions. Any failure returns 0 so the caller falls back to the
+    default of 1 — the daemon must still start when the backend is unreachable.
+    """
+    try:
+        # The provider daemon dials the backend through the SAME outbound
+        # proxy the rented browsers use (CEKI_PROXY_URL), so the server sees
+        # the proxy egress IP and can assign the right geo to this schedule.
+        # Without a proxy configured this is a direct call (unchanged).
+        _proxy = _proxy_from_env()
+        _proxy_url = _proxy_url_with_creds(_proxy)
+        _client = httpx.Client(proxy=_proxy_url, timeout=15)
+        try:
+            resp = _client.get(
+                f"{api_base}/api/browser/me",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+        finally:
+            _client.close()
+        resp.raise_for_status()
+        data = resp.json()
+        s = data.get("settings", {}) if isinstance(data, dict) else {}
+        if s.get("multi_session") is True:
+            n = s.get("max_sessions")
+            n = int(n) if n not in (None, "") else 0
+            if n > 0:
+                log.info(
+                    "daemon: adopting schedule max_sessions=%d (multi_session) for schedule %s",
+                    n, schedule_id,
+                )
+                return n
+        log.info(
+            "daemon: schedule %s multi_session=%s max_sessions=%s -> default 1",
+            schedule_id, s.get("multi_session"), s.get("max_sessions"),
+        )
+    except Exception as exc:
+        log.warning("daemon: schedule fetch failed (%s) — default max_sessions=1", exc)
+    return 0
+
+
+def _proxy_from_env() -> ProxySpec | None:
+    """Parse proxy config from container env.
+
+    Accepts either a single URL (CEKI_PROXY_URL, full URL optionally with
+    credentials) or discrete parts:
+        CEKI_PROXY_URL=http://msk:pass@176.12.64.201:3128
+        # or
+        CEKI_PROXY_SCHEME=http
+        CEKI_PROXY_HOST=176.12.64.201
+        CEKI_PROXY_PORT=3128
+        CEKI_PROXY_USERNAME=msk
+        CEKI_PROXY_PASSWORD=...
+    Returns None when no proxy is configured.
+    """
+    url = os.environ.get("CEKI_PROXY_URL") or os.environ.get("CEKI_PROXY")
+    if url:
+        s = url.strip()
+        # Accept "protocol://user:pass@host:port" and strip any trailing /
+        if "://" not in s:
+            s = "http://" + s
+        try:
+            from urllib.parse import urlparse
+
+            u = urlparse(s)
+            scheme = (u.scheme or "http").lower()
+            if scheme == "https":
+                scheme = "http"
+            if not u.hostname:
+                return None
+            return ProxySpec(
+                scheme=scheme,
+                host=u.hostname,
+                port=u.port or (3128 if scheme == "http" else 1080),
+                username=u.username or None,
+                password=u.password or None,
+            )
+        except Exception:
+            return None
+
+    scheme = (os.environ.get("CEKI_PROXY_SCHEME") or "http").lower()
+    host = (os.environ.get("CEKI_PROXY_HOST") or "").strip()
+    if not host:
+        return None
+    try:
+        port = int(os.environ.get("CEKI_PROXY_PORT") or "3128")
+    except ValueError:
+        port = 3128
+    return ProxySpec(
+        scheme=scheme,
+        host=host,
+        port=port,
+        username=os.environ.get("CEKI_PROXY_USERNAME") or None,
+        password=os.environ.get("CEKI_PROXY_PASSWORD") or None,
+    )
+
+
+def _proxy_url_with_creds(proxy: ProxySpec | None) -> str | None:
+    """Proxy URL with credentials embedded (httpx/websockets need userinfo)."""
+    if proxy is None:
+        return None
+    netloc = proxy.host
+    if proxy.port:
+        netloc += f":{proxy.port}"
+    if proxy.username:
+        from urllib.parse import quote
+        netloc = f"{quote(proxy.username, safe='')}:{quote(proxy.password or '', safe='')}@{netloc}"
+    return f"{proxy.scheme}://{netloc}"
+
+
+_GEO_CACHE: ProxyGeo | None = None
+_GEO_CACHE_TS = 0.0
+_GEO_TTL_S = 6 * 3600
+
+# IANA tz → BCP-47 locale for the countries we can plausibly see behind a
+# commercial proxy. Matches the extension's own LOCALES/ACCEPT_LANGUAGE_MAP
+# idea: locale + accept-language should agree with the egress country.
+_COUNTRY_LOCALE: dict[str, str | None] = {
+    "RU": "ru-RU", "UA": "uk-UA", "BY": "be-BY", "KZ": "kk-KZ",
+    "DE": "de-DE", "FR": "fr-FR", "ES": "es-ES", "IT": "it-IT",
+    "NL": "nl-NL", "BE": "nl-BE", "PL": "pl-PL", "PT": "pt-PT",
+    "SE": "sv-SE", "NO": "nb-NO", "DK": "da-DK", "FI": "fi-FI",
+    "CZ": "cs-CZ", "SK": "sk-SK", "RO": "ro-RO", "BG": "bg-BG",
+    "HU": "hu-HU", "GR": "el-GR", "AT": "de-AT", "CH": "de-CH",
+    "GB": "en-GB", "US": "en-US", "CA": "en-CA",
+}
+
+
+def _proxy_geo(proxy: ProxySpec | None) -> ProxyGeo | None:
+    """Resolve the outbound proxy's egress geo by dialing ipwho.is THROUGH it.
+
+    Best-effort: any failure returns None (caller keeps existing defaults: TZ
+    from env, extension's hardcoded West-Europe fingerprint). Cached for
+    ``_GEO_TTL_S`` so the daemon does not hammer the geo service on reconnects.
+
+    The request goes through the SAME proxy the rented browsers use, so the
+    answer describes the IP those browsers will present to sites — the whole
+    point of aligning browser-side geo with the rented identity.
+    """
+    global _GEO_CACHE, _GEO_CACHE_TS
+    if _GEO_CACHE is not None and (time.time() - _GEO_CACHE_TS) < _GEO_TTL_S:
+        return _GEO_CACHE
+    if proxy is None:
+        return None
+    proxy_url = _proxy_url_with_creds(proxy)
+    if not proxy_url:
+        return None
+    try:
+        import httpx
+        with httpx.Client(proxy=proxy_url, timeout=10) as client:
+            resp = client.get("https://ipwho.is/")
+        resp.raise_for_status()
+        data = resp.json()
+        cc = str(data.get("country_code") or "").upper()
+        # ipwho.is returns "timezone" as an OBJECT ({id, abbr, offset, ...}),
+        # not a plain IANA string — normalize to the IANA id so the value that
+        # reaches the backend/extension is "Europe/Moscow", not a shell-style
+        # dict repr that trips JSON/YaBrowser consumers.
+        tz_raw = data.get("timezone") or ""
+        tz = str(tz_raw.get("id") if isinstance(tz_raw, dict) else tz_raw).strip()
+        if not cc or not tz or not data.get("latitude") or not data.get("longitude"):
+            raise ValueError(f"ipwho.is missing geo fields: {data.get('success')}")
+        _GEO_CACHE = ProxyGeo(
+            country_code=cc,
+            country=str(data.get("country") or cc),
+            timezone=tz,
+            latitude=float(data["latitude"]),
+            longitude=float(data["longitude"]),
+            locale=_COUNTRY_LOCALE.get(cc),
+        )
+        _GEO_CACHE_TS = time.time()
+        log.info(
+            "daemon: proxy egress geo -> %s %s (%s, %.2f, %.2f)",
+            cc, tz, _GEO_CACHE.locale, _GEO_CACHE.latitude, _GEO_CACHE.longitude,
+        )
+        return _GEO_CACHE
+    except Exception as exc:
+        log.warning("daemon: proxy geo lookup failed: %s", exc)
+        return None
 
 
 def load_config() -> DaemonConfig:
@@ -207,7 +472,17 @@ def load_config() -> DaemonConfig:
         except ValueError:
             schedule_id = None
 
-    max_sessions = int(os.environ.get("CEKI_DAEMON_MAX_SESSIONS", "1"))
+    max_sessions_env = os.environ.get("CEKI_DAEMON_MAX_SESSIONS")
+    max_sessions = int(max_sessions_env) if max_sessions_env and max_sessions_env.strip() else 0
+    # If the operator did not pin CEKI_DAEMON_MAX_SESSIONS, adopt the schedule's
+    # own multi-session capacity from the backend (settings.max_sessions). The
+    # daemon otherwise defaults to 1 and rejects parallel rents even when the
+    # schedule advertises multi_session (e.g. subscription rents on 42306/42307
+    # with max_sessions=10). The schedule card is fetched with the same provider
+    # token the daemon uses on the provider WS; a failure is non-fatal (keep 1).
+    if max_sessions <= 0:
+        max_sessions = _schedule_max_sessions(api_base, token, schedule_id)
+
     cdp_start = int(os.environ.get("CEKI_DAEMON_CDP_START", str(DEFAULT_CDP_PORT_START)))
     display_start = int(os.environ.get("CEKI_DAEMON_DISPLAY_START", str(DEFAULT_DISPLAY_START)))
 
@@ -234,9 +509,14 @@ def load_config() -> DaemonConfig:
         # corporate build strips --load-extension, so the daemon must not rely
         # on an unpacked copy there.
         policy_installed_ext=(os.environ.get("CEKI_PROVIDER_BROWSER") == "yandex"),
-        cdps=list(range(cdp_start, cdp_start + max_sessions)),
-        displays=list(range(display_start, display_start + max_sessions)),
+        cdps=list(range(cdp_start, cdp_start + max(1, max_sessions))),
+        displays=list(range(display_start, display_start + max(1, max_sessions))),
+        proxy=_proxy_from_env(),
     )
+    # Resolve the egress geo for the outbound proxy (if any) so the extension's
+    # fingerprint + container TZ can match what sites see. Non-fatal: a failure
+    # keeps the previous defaults.
+    cfg.geo = _proxy_geo(cfg.proxy)
     cfg.local_ws_url = f"ws://127.0.0.1:{cfg.daemon_port}"
     return cfg
 
@@ -258,6 +538,9 @@ class Instance:
     ready: bool = False
     profile_mode: str | None = None  # 'main' | 'incognito' (None → incognito semantics)
     created_at: float = field(default_factory=time.time)
+    # Fallback CDP target (offscreen page) for storage seed when the SW route
+    # is sticky-500 on branded builds (Yandex).
+    offscreen_ws_fallback: str | None = None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -342,6 +625,8 @@ class SpawnManager:
         self._patch_stamp: str | None = None
         self._swept = False
         self._boot_slot = 0
+        self._captures: list[Any] = []
+        self._captures_stop: list[threading.Event] = []
 
     # -- public API (spec-shaped) ----------------------------------------------
 
@@ -407,6 +692,13 @@ class SpawnManager:
             inst = self._instances.pop(session_id, None)
         if inst is None:
             return
+        # Stop any debug-capture manager bound to this instance's CDP port.
+        stops = getattr(self, "_captures_stop", [])
+        if stops:
+            for s in stops:
+                s.set()
+            self._captures_stop = []
+            self._captures = []
         self._kill_group(inst)
         # Return CDP/display slots to the pool so a later ensure() can reuse
         # them (sequential rent cycle: session_end -> next match spawns again).
@@ -583,7 +875,24 @@ class SpawnManager:
 
     def _build_chrome_args(self, inst: Instance, ext_dir: str) -> list[str]:
         args = list(_CHROME_ARGS)
+        if self.cfg.proxy:
+            # Proxy is applied by the EXTENSION via chrome.proxy.settings
+            # (seeded from env → storage ceki_proxy). Verified: --proxy-server
+            # is NOT honored by Yandex corporate on the network level — without
+            # creds it 407-stalls (white frame), with creds it yields
+            # chrome-error:// (unreachable page). chrome.proxy.settings from
+            # the extension is the only path that actually tunnels (works on
+            # Chrome; fixing Yandex adoption is the current task).
+            log.info("daemon: rental proxy applied by extension -> %s", self.cfg.proxy.server_url)
         args.append(f"--window-size={self.cfg.width},{self.cfg.height}")
+        # pseudo-yandex: the YaBrowser UA is delivered by the EXTENSION via
+        # JS injection (Page.addScriptToEvaluateOnNewDocument, key
+        # ceki_pseudo_ua seeded in storage), NOT via --user-agent at launch.
+        # Verified on system Chromium 154: a launcher-level --user-agent makes
+        # the extension's SW CDP target answer HTTP 500, so the daemon could
+        # never complete the storage handshake and every rent died (offline:
+        # black screen, watchdog reap). JS injection survives because it does
+        # not touch the Network domain and does not disturb the SW.
         args.append(f"--user-data-dir={inst.profile_dir}")
         args.append(f"--disk-cache-dir={inst.profile_dir}/cache")
         args.append(f"--remote-debugging-port={inst.cdp_port}")
@@ -627,6 +936,34 @@ class SpawnManager:
         return proc
 
     def _launch_xvfb(self, inst: Instance) -> subprocess.Popen:
+        # Adoption path (host-provided Xvfb): if an X server already answers
+        # :<display>, use it instead of spawning our own. A self-spawned Xvfb
+        # puts its socket in a container-private tmpfs the stream sidecar can
+        # never reach, making rentals invisible (the core bug we fixed by
+        # pointing containers at the host /tmp/.X11-unix). Adopt the existing
+        # live display: return a handle carrying its real pid so destroy() can
+        # still kill the right process and no signalfig occurs.
+        probe = subprocess.run(
+            ["timeout", "3", "xwininfo", "-display", f":{inst.display}", "-root"],
+            capture_output=True,
+        )
+        if probe.returncode == 0:
+            ext = _procs_with_display(inst.display)
+            if ext:
+                pid = ext[0][0]
+                log.info("xvfb: adopting host Xvfb on :%d (pid %s)", inst.display, pid)
+                env = dict(os.environ)
+                return _Popen_handle(pid=pid)
+            # xwininfo answered but NO process actually owns this display
+            # (transient/stale probe success — seen as "adopting host Xvfb on
+            # :142 (pid -1)", which left rentals with NO X server → Chrome
+            # "Missing X server" → rent never spawned). Treat as absent and
+            # fall through to spawn our own Xvfb below.
+            log.warning(
+                "xvfb: :%d xwininfo ok but no owning process — spawning own Xvfb",
+                inst.display,
+            )
+
         # A previous run may have left an orphaned Xvfb on this display (its
         # socket was unlinked but the process survived a hard kill). That
         # stale process owns the display number and blocks a fresh Xvfb from
@@ -669,6 +1006,29 @@ class SpawnManager:
         except Exception:
             pass
         return proc
+
+    def _maybe_start_debug_capture(self, inst: Instance) -> None:
+        """Start extension SW-console capture on this instance's CDP port when
+        CEKI_PROVIDER_DEBUG_LOG is set. Unlike app mode, the browser already
+        listens on inst.cdp_port (no separate 9333 browser), so we feed the
+        capture manager that port. Pure opt-in; no-op otherwise."""
+        cfg = provider_debug.config_from_env()
+        if cfg is None:
+            return
+        self._captures = getattr(self, "_captures", [])
+        self._captures_stop = getattr(self, "_captures_stop", [])
+        stop = threading.Event()
+        mgr = provider_debug.start_capture(
+            provider_debug.DebugConfig(log_path=cfg.log_path, port=inst.cdp_port,
+                                       ping_interval=cfg.ping_interval,
+                                       ping_timeout=cfg.ping_timeout),
+            _DEFAULT_EXT_ID,
+            stop,
+        )
+        if mgr is not None:
+            self._captures.append(mgr)
+            self._captures_stop.append(stop)
+            log.info("debug capture started for instance %s on cdp port %s", inst.session_id, inst.cdp_port)
 
     def _spawn_and_handshake(self, inst: Instance, params: dict) -> None:
         """Blocking spawn: Xvfb + Chrome (two-launch incognito) + token handshake.
@@ -720,6 +1080,22 @@ class SpawnManager:
         entry = settings.setdefault(ext_id, {})
         entry["incognito"] = True
         entry["state"] = 1
+
+        # 3b) outbound proxy baked into Preferences (applies at launch, both
+        # regular and incognito windows). Credentials are NOT stored here —
+        # the extension answers CONNECT auth via webRequest.onAuthRequired
+        # using the creds the daemon seeds into chrome.storage.local.
+        if self.cfg.proxy:
+            prefs["proxy"] = {
+                "mode": "fixed_servers",
+                "server": {
+                    "scheme": self.cfg.proxy.scheme,
+                    "host": self.cfg.proxy.host,
+                    "port": self.cfg.proxy.port,
+                },
+                "bypass_list": self.cfg.proxy.bypass_list,
+            }
+
         prefs_path.write_text(json.dumps(prefs))
         log.info("two-launch: incognito granted for %s", ext_id)
 
@@ -729,11 +1105,32 @@ class SpawnManager:
         self._discover_ext_id(inst, timeout=30)
         # 5) token handshake via the extension panel over CDP.
         self._handshake(inst)
+        # 5a) optional SW-console capture on this instance's CDP port.
+        self._maybe_start_debug_capture(inst)
+        # 5b) Re-spawn guard: if the extension never connected its presence-WS
+        # (handshake failed on a CDP 500 / dead target / stale browser on this
+        # port), give ONE fresh relaunch of the run-phase Chrome before the
+        # watchdog reaps the session. Cheap, bounded, and it turns the
+        # intermittent Yandex CDP WS 500 (which currently kills ~1/3 rents)
+        # into a recoverable second attempt.
+        ws = getattr(inst, "ws", None)
+        ws_open = ws is not None and getattr(ws, "state", None) == 1
+        if not ws_open:
+            log.warning("handshake: presence-WS not connected after handshake, relaunching run-phase Chrome once")
+            self._kill_proc_group(proc2.pid)
+            self._wait_exit(proc2.pid)
+            proc2 = self._launch_chrome(inst, chrome_args)
+            inst.chrome_pid = proc2.pid
+            self._discover_ext_id(inst, timeout=30)
+            self._handshake(inst)
         # 6) opportunistic: drop Yandex's default background tabs (ya.ru,
         #    chrome://wallpaper, alissenger) that eat ~1GB on an idle rent.
         #    Deferred so the extension's session tab (about:blank) opens first;
         #    failures are non-fatal.
         threading.Timer(2.0, self._close_idle_tabs, args=(inst,)).start()
+        # pseudo-yandex YaBrowser UA is applied at launch (--user-agent in
+        # _build_chrome_args); page-level CDP patching conflicts with the
+        # extension's debugger session on Chromium 154 and kills the rent.
 
     def _discover_ext_id(self, inst: Instance, expected: str | None = None,
                          timeout: float = 60) -> str | None:
@@ -776,15 +1173,40 @@ class SpawnManager:
         by the daemon.
         """
         # The service worker may take a moment to spin up after launch; poll
-        # for it before giving up.
-        sw_ws = None
-        for _ in range(40):
-            sw_ws = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
-            if sw_ws is not None:
-                break
-            time.sleep(0.5)
-        if sw_ws is None:
-            sw_ws = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
+        # for it before giving up. On branded builds (yandex) the SW target
+        # answers HTTP 500 on ANY WS-upgrade (chrome.debugger already attached
+        # there) — the offscreen document is a plain page target that usually
+        # answers fine, so for yandex we wait for it FIRST.
+        if self.cfg.policy_installed_ext:
+            sw_ws = None
+            for _ in range(40):  # up to ~20s for offscreen to appear
+                off = self._find_offscreen_target(inst)
+                if off is not None:
+                    sw_ws = off
+                    break
+                time.sleep(0.5)
+            if sw_ws is None:
+                sw_ws = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
+            log.info("handshake: yandex storage channel -> %s", ("offscreen" if "offscreen" in (sw_ws or "") else "sw"))
+        else:
+            # The token MUST land in the extension's service worker: that is the
+            # context whose storage.onChanged pushes token_updated to the
+            # offscreen doc (which opens the presence-WS). The background page
+            # target on Chromium 154 answers CDP but has NO extension API
+            # (chrome is undefined) — writing storage.set there fails silently
+            # and the rent dies without a presence-WS. Prefer the SW; fall back
+            # to background_page only if no SW target exists at all.
+            sw_ws = None
+            for _ in range(40):
+                sw_ws = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
+                if sw_ws is not None:
+                    break
+                time.sleep(0.5)
+            if sw_ws is None:
+                sw_ws = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
+        # Store an offscreen fallback on the INSTANCE (not self — parallel
+        # rents share the daemon). Used when the SW route is sticky-500.
+        inst.offscreen_ws_fallback = self._find_offscreen_target(inst) or sw_ws
         if sw_ws is None:
             log.warning("handshake[%s]: extension service worker target not found", inst.session_id)
             return
@@ -847,7 +1269,7 @@ class SpawnManager:
         payload["ceki_runtime_config"] = {
             "relay_ws": self.cfg.local_ws_url,
         }
-        # One round-trip: unconditionally write the service keys, then seed the
+# One round-trip: unconditionally write the service keys, then seed the
         # UI toggles — unconditionally for the daemon's own (non-main) profiles,
         # only-when-undefined for the host's real profile. The JS reads the
         # current storage in-process, so there is no daemon-side race with the
@@ -862,6 +1284,45 @@ class SpawnManager:
         ui_seed_json = json.dumps(ui_seed)
         # host profile → keep the user's value; daemon's own profile → overwrite.
         guard = "current[k] === undefined" if seed_only_undefined else "true"
+        # Outbound proxy (from container env): the extension answers proxy auth
+        # via webRequest.onAuthRequired, so pass the credentials through the
+        # same storage channel. When no proxy is configured this is absent and
+        # the extension keeps its default (direct / per-rent configure).
+        if self.cfg.proxy:
+            payload["ceki_proxy"] = {
+                "enabled": True,
+                "scheme": self.cfg.proxy.scheme,
+                "host": self.cfg.proxy.host,
+                "port": self.cfg.proxy.port,
+                "username": self.cfg.proxy.username,
+                "password": self.cfg.proxy.password,
+            }
+        # Egress geo of the outbound proxy (if resolved): lets the extension
+        # build its fingerprint (timezone / locale / geolocation) from the geo
+        # the rented browser actually advertises, instead of the hardcoded
+        # West-European defaults. Absent when no proxy or the lookup failed.
+        if self.cfg.geo:
+            payload["ceki_geo"] = {
+                "country_code": self.cfg.geo.country_code,
+                "country": self.cfg.geo.country,
+                "timezone": self.cfg.geo.timezone,
+                "latitude": self.cfg.geo.latitude,
+                "longitude": self.cfg.geo.longitude,
+                "locale": self.cfg.geo.locale,
+            }
+        # pseudo-yandex: the YaBrowser UA string is consumed by the extension's
+        # fingerprint inject (navigator.userAgent/userAgentData JS override).
+        # Seeding it here (instead of --user-agent at launch) keeps the SW CDP
+        # target healthy on system Chromium 154 — see _build_chrome_args.
+        if _pseudo_yandex_enabled():
+            payload["ceki_pseudo_ua"] = {
+                "userAgent": provider_app._PSEUDO_UA,
+                "brands": [
+                    {"brand": "Not A(Brand", "version": "99.0.0.0"},
+                    {"brand": "Yandex", "version": f"{provider_app._PSEUDO_YABROWSER_MAJOR}.{provider_app._PSEUDO_YABROWSER_MINOR}.0.0"},
+                    {"brand": "Chromium", "version": provider_app._PSEUDO_UA_CHROMIUM_MAJOR},
+                ],
+            }
         expr = (
             "(async () => {"
             "const keys = Object.keys(" + ui_seed_json + ");"
@@ -876,115 +1337,126 @@ class SpawnManager:
             "return JSON.stringify({ seeded });"
             "})()"
         )
-        try:
-            result = self._cdp_eval(sw_ws, expr)
-            log.info("handshake[%s]: storage set -> %s", inst.session_id, json.dumps(result)[:200])
-        except Exception as exc:
-            log.warning("handshake[%s] failed: %s", inst.session_id, exc)
+# Retry the storage write a few times against a FRESH target ws. On
+        # Yandex corporate, a CDP WS-upgrade can intermittently answer
+        # HTTP 500 (stale/racing target); re-listing /json/list usually yields
+        # a working websocketDebuggerUrl. Doing this here (not inside
+        # _cdp_eval) keeps every other CDP eval predictable.
+        max_sets = 4
+        tried_fallback = False
+        for attempt in range(max_sets):
+            try:
+                result = self._cdp_eval(sw_ws, expr)
+                log.info("handshake: storage set -> %s", json.dumps(result)[:200])
+                break
+            except Exception as exc:
+                log.warning(
+                    "handshake: storage.set attempt %d/%d failed on %s: %r",
+                    attempt + 1, max_sets, sw_ws, exc,
+                )
+                # Re-resolve the SW target — the previous ws may be dead
+                # (HTTP 500) and the extension may have re-registered it.
+                refreshed = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
+                if refreshed is None:
+                    refreshed = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
+                if refreshed and refreshed != sw_ws:
+                    log.info("handshake: SW target changed %s -> %s", sw_ws, refreshed)
+                    sw_ws = refreshed
+                elif not tried_fallback and getattr(inst, "offscreen_ws_fallback", None):
+                    # SW route is sticky-500 (Yandex): try the offscreen page
+                    # target as the storage.set channel instead.
+                    log.info("handshake: SW target sticky-fail — switching to offscreen target")
+                    sw_ws = inst.offscreen_ws_fallback
+                    tried_fallback = True
+                time.sleep(1.0)
         self._retry_token_after_offscreen(inst, sw_ws, payload)
 
     def _retry_token_after_offscreen(
         self, inst: Instance, sw_ws: str, payload: dict
     ) -> None:
-        """Keep re-delivering the token until the presence-WS connects.
+        """Keep the token set until the extension's presence-WS connects.
 
-        The first ``storage.local.set`` fires ``storage.onChanged`` immediately,
-        while the SW's ``offscreenPort`` may still be null (offscreen document
-        not created yet). ``sendToOffscreen(token_updated)`` is then a no-op and
-        the message is lost; when offscreen later connects, ``offscreen_hello``
-        sees ``sanctum_token === _lastKnownToken`` and skips ``token_updated`` —
-        so the offscreen never opens its presence-WS (QA repro, ev 8639).
-
-        Fix on the daemon side (no extension change): clear the token and
-        re-set it *repeatedly* until the extension's presence-WS actually
-        connects. The second+ ``onChanged`` fires ``token_cleared`` then
-        ``token_updated`` into the live ``offscreenPort``. A SINGLE clear+set
-        is not enough under parallel spawn: the offscreen page target can be
-        visible over CDP while its module script (which registers the token
-        callback) has not run yet — a re-delivery in that window is lost the
-        same way as the first, and the instance stalls without a presence-WS
-        until the watchdog reaps it (B9 1-of-3 loss, ev 10077). Loop the
-        clear+set until the WS is up or a generous deadline (the watchdog's
-        connect timeout) expires.
+        Chromium 154: the offscreen document (which opens the presence-WS) is
+        created by the extension SW only AFTER a stable sanctum_token lands in
+        chrome.storage.local. Destructive clear+set loops the token_cleared /
+        token_updated events so fast the offscreen never stabilises. Instead:
+        write (or re-write) the token + relay config, then poll for the offscreen
+        CDP target and finally wait for presence-WS — no removes.
         """
         deadline = time.time() + int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90"))
-        # The offscreen may not exist yet (document not created). Wait for the
-        # CDP page target first so a clear+set has a live offscreen to receive
-        # the re-delivery.
-        for _ in range(60):  # up to ~30s for offscreen to appear
-            if self._find_offscreen_target(inst) is not None:
-                break
-            time.sleep(0.5)
-        else:
-            log.warning("handshake[%s]: offscreen target never appeared, token may be lost", inst.session_id)
-
-        round_no = 0
+        # 1. Ensure the token/config is set (idempotent — re-set refreshes the
+        #    storage.onChanged trigger without tearing the SW down).
+        re_set = 0
         while time.time() < deadline:
-            round_no += 1
-            ws = inst.ws
+            # If presence already connected, done.
+            ws = getattr(inst, "ws", None)
             if ws is not None and getattr(ws, "state", 3) == 1:
-                log.info(
-                    "handshake[%s]: presence-WS connected (round %d)",
-                    inst.session_id, round_no,
-                )
+                log.info("handshake: presence-WS connected (re-set round %d)", re_set)
                 return
-            # Re-resolve the SW target: CDP evals can outlive the SW (it may
-            # have been torn down under load) — a stale ws_url just errors.
+            # Re-resolve SW target (stale WS after relaunch / 500).
             cur_sw = sw_ws
-            if round_no > 1:
-                found = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
-                if found is None:
-                    found = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
-                if found is not None:
-                    cur_sw = found
-            # Clear then re-set: onChanged fires token_cleared then
-            # token_updated, now delivering into the live offscreenPort.
-            clear_ok = False
+            found = self._find_target_ws(inst, "service_worker", _DEFAULT_EXT_ID)
+            if found is None:
+                found = self._find_target_ws(inst, "background_page", _DEFAULT_EXT_ID)
+            if found is not None:
+                cur_sw = found
             try:
-                self._cdp_eval(cur_sw, "chrome.storage.local.remove('sanctum_token', () => true)")
-                clear_ok = True
+                self._cdp_eval(
+                    cur_sw,
+                    "chrome.storage.local.set(" + json.dumps(payload) + ")",
+                )
+                re_set += 1
             except Exception as exc:
-                log.warning("handshake[%s]: token clear failed: %s", inst.session_id, exc)
-            time.sleep(0.5)  # let the onChanged debounce (50ms + tick) process
-            try:
-                if clear_ok:
-                    result = self._cdp_eval(
-                        cur_sw,
-                        "chrome.storage.local.set(" + json.dumps(payload) + ", () => true)",
-                    )
-                    log.info(
-                        "handshake[%s]: token re-set (round %d) -> %s",
-                        inst.session_id, round_no, json.dumps(result)[:120],
-                    )
-            except Exception as exc:
-                log.warning("handshake[%s]: token re-set failed: %s", inst.session_id, exc)
+                log.warning("handshake: token set (round %d) failed: %s", re_set, exc)
+                time.sleep(1.0)
+                continue
+            # 2. Give the SW a beat to create the offscreen document (which
+            #    opens the presence-WS on token_updated).
+            time.sleep(2.0)
+        log.warning("handshake: presence-WS did not connect within %ds", int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90")))
 
-            # Give the WS a moment to come up before the next round.
-            for _ in range(10):  # ~5s
-                ws = inst.ws
-                if ws is not None and getattr(ws, "state", 3) == 1:
-                    log.info("handshake[%s]: presence-WS connected after re-delivery (round %d)", inst.session_id, round_no)
-                    return
-                time.sleep(0.5)
-        log.warning(
-            "handshake[%s]: presence-WS never came up within %.0fs (re-delivery exhausted)",
-            inst.session_id, deadline - time.time() + int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90")),
-        )
 
     def _find_target_ws(self, inst: Instance, kind: str, ext_id: str) -> str | None:
-        """Return the webSocketDebuggerUrl of the first target of ``kind`` whose
-        URL belongs to ``ext_id``."""
+        """Return the webSocketDebuggerUrl of a live SW/background target.
+
+        Chrome may list MULTIPLE service_workers / background_pages for the
+        same extension (stale generations from previous rentals linger until
+        GC'd). Picking the FIRST one hits a dead target whose WS answers 500
+        or ECONNREFUSED — the root of the intermittent spawn flak. Take the
+        LAST (newest) target instead, and verify it is actually connectable.
+        """
         cdp = f"http://127.0.0.1:{inst.cdp_port}"
         try:
             targets = httpx.get(f"{cdp}/json/list", timeout=2).json()
         except Exception:
             return None
+        candidates: list[dict] = []
         for t in targets:
             if t.get("type") != kind:
                 continue
             url = t.get("url") or ""
-            if f"chrome-extension://{ext_id}/" in url:
-                return t.get("webSocketDebuggerUrl")
+            if f"chrome-extension://{ext_id}/" not in url:
+                continue
+            candidates.append(t)
+        if not candidates:
+            return None
+        # newest (last listed) first; probe each with a real WS handshake.
+        # A plain TCP connect is NOT enough on Chromium 154: the port is open
+        # but the WS-upgrade to a stale/stopped extension worker answers
+        # HTTP 500 (and the storage handshake dies). Return the first target
+        # whose WS-upgrade actually succeeds.
+        import websockets.sync.client as _wscl
+        for t in reversed(candidates):
+            ws_url = t.get("webSocketDebuggerUrl") or ""
+            try:
+                with _wscl.connect(ws_url, open_timeout=1.0, close_timeout=0.2):
+                    return ws_url
+            except Exception:
+                continue  # 500 / refused / stale — try next
+        # No WS-connectable candidate. Do NOT fall back to a dead target:
+        # storage.set there answers 500 and the handshake stalls. Return None
+        # so the caller keeps polling — a healthy worker appears a moment
+        # later (Chromium 154 spawns the extension SW async after launch).
         return None
 
     def _find_offscreen_target(self, inst: Instance) -> str | None:
@@ -1002,28 +1474,58 @@ class SpawnManager:
                 return t.get("webSocketDebuggerUrl")
         return None
 
-    def _cdp_eval(self, ws_url: str, expression: str, timeout: float = 20.0) -> Any:
-        """Evaluate ``expression`` in a CDP target via its webSocketDebuggerUrl."""
+    def _cdp_send(self, ws_url: str, method: str, params: dict | None = None,
+                  timeout: float = 5.0) -> Any:
+        """Send one CDP command to a target and return its result.
+
+        Shared transport for ``_cdp_eval`` (Runtime.evaluate) and
+        ``_cdp_command`` (any other method, e.g. Network.setUserAgentOverride).
+        Short timeout (5s): during spawn the extension SW may appear in
+        /json/list before it is ready to serve CDP — a 20s send turned one
+        retry loop into an 80s stall and the watchdog reaped the rent. A fast
+        refusal lets the caller's retry/refresh/relaunch path kick in quickly.
+        """
         async def _run() -> Any:
-            async with websockets.connect(ws_url, max_size=64 * 1024 * 1024) as sock:
-                request_id = 1
-                await sock.send(json.dumps({
-                    "id": request_id,
-                    "method": "Runtime.evaluate",
-                    "params": {
-                        "expression": expression,
-                        "awaitPromise": True,
-                        "returnByValue": True,
-                    },
-                }))
-                while True:
-                    msg = json.loads(await asyncio.wait_for(sock.recv(), timeout=timeout))
-                    if msg.get("id") == request_id:
-                        if "error" in msg:
-                            raise RuntimeError(f"CDP error: {msg['error']}")
-                        res = msg.get("result", {}).get("result", {})
-                        return res.get("value")
+            # websockets 13.x: ``connect()`` returns an async-CM (opens on enter).
+            # Keep the open-phase exception visible with the target URL so a
+            # branded-yandex CDP rejection (HTTP 40x/500 on WS-upgrade) is
+            # distinguishable from a transport failure in the daemon log.
+            try:
+                async with websockets.connect(ws_url, max_size=64 * 1024 * 1024) as sock:
+                    request_id = 1
+                    await sock.send(json.dumps({
+                        "id": request_id,
+                        "method": method,
+                        "params": params or {},
+                    }))
+                    while True:
+                        msg = json.loads(await asyncio.wait_for(sock.recv(), timeout=timeout))
+                        if msg.get("id") == request_id:
+                            if "error" in msg:
+                                raise RuntimeError(f"CDP error: {msg['error']}")
+                            return msg.get("result", {})
+            except Exception as exc:
+                log.warning("cdp: CDP %s failed ws=%s : %r", method, ws_url, exc)
+                raise
         return asyncio.run(_run())
+
+    def _cdp_eval(self, ws_url: str, expression: str, timeout: float = 5.0) -> Any:
+        """Evaluate ``expression`` in a CDP target via its webSocketDebuggerUrl."""
+        res = self._cdp_send(
+            ws_url, "Runtime.evaluate", {
+                "expression": expression,
+                "awaitPromise": True,
+                "returnByValue": True,
+            }, timeout=timeout,
+        )
+        return (res or {}).get("result", {}).get("value")
+
+    # -- pseudo-yandex UA ------------------------------------------------
+    # The YaBrowser UA is applied at LAUNCH via --user-agent (see
+    # _build_chrome_args). Page-level Network.setUserAgentOverride over a
+    # daemon-owned WS conflicts with the extension's own chrome.debugger
+    # session on system Chromium 154 (SW CDP answers 500) and breaks the
+    # rental; launch-level is the only path that survives the handshake.
 
     def _close_idle_tabs(self, inst: Instance) -> None:
         """Close Yandex's default background surfaces after launch.
@@ -1203,6 +1705,26 @@ class ProviderWsClient:
     def relay_url(self) -> str:
         return self.cfg.relay_url
 
+    def _welcome_geo(self) -> dict | None:
+        """Geo block advertised in ``welcome`` for the relay → backend flow.
+
+        Carries the outbound proxy's egress geo (country/timezone/coords) so
+        the backend can store it on the schedule even when it does not or
+        cannot geo-resolve the provider's client_ip (e.g. WS dialed through a
+        proxy that shields its egress). Absent when no proxy geo is known.
+        """
+        g = self.cfg.geo
+        if g is None:
+            return None
+        return {
+            "country_code": g.country_code,
+            "country": g.country,
+            "timezone": g.timezone,
+            "latitude": g.latitude,
+            "longitude": g.longitude,
+            "locale": g.locale,
+        }
+
     async def send(self, msg: dict | str) -> None:
         ws = self.ws
         if ws is None or ws.state != 1:  # OPEN
@@ -1332,8 +1854,16 @@ class ProviderWsClient:
             inbox.put_nowait(None)
 
     async def run(self) -> None:
+        import time as _time
         while not self._stop:
             try:
+                # NOTE: dialing the relay THROUGH the outbound proxy would make
+                # the relay's client_ip == proxy egress IP, so the backend could
+                # geo-resolve the schedule purely by IP. websockets.connect()
+                # does not support an HTTP proxy for ws:// (no proxy= kwarg in
+                # 13.1), so the provider's egress geo is instead carried
+                # explicitly in the welcome message (see _welcome_geo) and
+                # forwarded to the backend as client_geo in the 'online' event.
                 async with websockets.connect(
                     self.relay_url,
                     subprotocols=[f"bearer.{self.cfg.token}"],
@@ -1341,7 +1871,7 @@ class ProviderWsClient:
                     ping_interval=None,  # relay drives ping itself
                 ) as ws:
                     self.ws = ws
-                    self._reconnect_delay = 1.0
+                    self._conn_started = _time.monotonic()
                     log.info("provider-ws: connected %s", self.relay_url)
                     await self.send({
                         "type": "welcome",
@@ -1350,6 +1880,7 @@ class ProviderWsClient:
                         "browser_flavor": provider_browser_flavor(),
                         "browser_name": provider_browser_name(),
                         "active_session_id": self.router.active_session_id(),
+                        "geo": self._welcome_geo(),
                     })
                     # Concurrent message handling: a dedicated reader task
                     # decodes frames off the relay socket into an unbounded
@@ -1388,6 +1919,14 @@ class ProviderWsClient:
             if self._stop:
                 break
             self.ws = None
+            # Anti-reconnect-storm: if the connection died within a few seconds
+            # of connecting (e.g. the relay rejecting/closing us, or a token
+            # burst), keep growing the backoff — do NOT reset it on a short
+            # lived connection, or we flap 1/s forever. Reset only after the
+            # link held for a healthy stretch.
+            stayed = _time.monotonic() - getattr(self, "_conn_started", _time.monotonic())
+            if stayed >= 10.0:
+                self._reconnect_delay = 1.0
             await asyncio.sleep(self._reconnect_delay)
             self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
 
@@ -1501,6 +2040,8 @@ class LocalWsServer:
                 # _activeSessionId is unset) — the relay then can't route them
                 # to the renter (signaling: no peer map for ""), so P2P never
                 # completes. Backfill the session_id from the bound instance.
+                if msg.get("type") in ("cdp_response", "cdp_event"):
+                    log.info("local-ws: ext->relay %s for %s", msg.get("type"), inst.session_id)
                 if isinstance(msg, dict) and not msg.get("session_id"):
                     msg = {**msg, "session_id": inst.session_id}
                 await self.relay.send(msg)
@@ -1523,6 +2064,7 @@ class Daemon:
         self.relay = ProviderWsClient(cfg, self.spawner, self.router)
         self.local = LocalWsServer(cfg, self.spawner, self.relay)
         self._stop_event = threading.Event()
+        self._captures: list[Any] = []
         self._server = None
 
     async def _run(self) -> None:
@@ -1636,6 +2178,18 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
     cfg = load_config()
+    # If the operator did not pin TZ, adopt the outbound proxy's egress
+    # timezone so the browsers we spawn report a local time consistent with the
+    # geo their public IP advertises (entrypoint mirrors this via /etc/timezone
+    # fallback when there is no proxy; daemon-side override wins when the proxy
+    # geo is known).
+    if not os.environ.get("TZ") and cfg.geo and cfg.geo.timezone:
+        os.environ["TZ"] = cfg.geo.timezone
+        try:
+            time.tzset()
+        except Exception:
+            pass
+        log.info("daemon: adopted proxy egress TZ=%s", cfg.geo.timezone)
     log.info(
         "daemon: schedule=%s sessions=%d cdp_pool=%s..%s displays=%s..%s storage_key=%s persist=%s",
         cfg.schedule_id,

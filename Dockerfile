@@ -20,7 +20,6 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     DISPLAY=:99 \
     PYTHONPATH=/opt/ceki/src
 
@@ -36,11 +35,15 @@ LABEL org.opencontainers.image.source=https://github.com/Ceki-me/docker-browser 
 # Chromium runtime libraries + Xvfb virtual display (Chromium needs a display to
 # run as a "visible" provider browser; Xvfb provides it headlessly).
 # libnss3-tools: certutil for the NSS trust DB — see the Russian Trusted CA block.
+# chromium is the plain unbranded Chromium package (full CDP, incl.
+# Browser.* download control) — NOT Chrome-for-Testing from Playwright, which
+# lacks some CDP commands (Browser.setDownloadBehavior unavailable).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libnss3 libnspr4 libnss3-tools libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
         libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 \
         libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 libxshmfence1 \
         libglib2.0-0 libgdk-pixbuf-2.0-0 xvfb xauth x11-utils ca-certificates curl \
+        chromium \
     && rm -rf /var/lib/apt/lists/*
 
 # Russian Trusted Root CA / Sub CA (Минцифры, НУЦ) — the CA that sanctioned
@@ -88,19 +91,16 @@ RUN update-ca-certificates \
             -i /usr/local/share/ca-certificates/russian_trusted_sub_ca.crt; \
     done
 
-# Python deps: the SDK (API client + config) and Playwright (Chromium driver).
+# Python deps: the SDK (API client + config) only — no Playwright; the browser
+# is the system chromium installed via apt above.
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Provider launcher module (this repo).
 COPY src/ /opt/ceki/src/
 
-# Chromium pinned by Playwright — the provider browser on this image.
-RUN python -m playwright install chromium
-
-# This image rents out Playwright's Chromium (app.py reads the env to pick the
-# binary; settable at runtime, e.g. CEKI_PROVIDER_BROWSER=pseudo-yandex is
-# meaningless here — the YaBrowser UA patch lives on the pseudo-yandex image).
+# This image rents out the system Chromium (/usr/bin/chromium). app.py reads
+# CEKI_PROVIDER_BROWSER to pick the binary; plain chromium = default.
 ENV CEKI_PROVIDER_BROWSER=chromium
 
 # Bundled browser extension dist (staged into extension/ by build.sh).

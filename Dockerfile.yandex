@@ -33,7 +33,6 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     DISPLAY=:99 \
     PYTHONPATH=/opt/ceki/src
 
@@ -45,12 +44,16 @@ LABEL org.opencontainers.image.source=https://github.com/Ceki-me/docker-browser 
 
 # Yandex Browser runtime libraries (superset of Chromium's) + Xvfb virtual
 # display + libnss3-tools (certutil for the NSS trust DB — see the CA block).
+# chromium (apt, system) is installed too: app.py maps the "chromium" /
+# "pseudo-yandex" flavors to /usr/bin/chromium, so the yandex image also
+# carries the same system-Chromium fallback binary the base Dockerfile uses
+# (full CDP incl. Browser.setDownloadBehavior).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libnss3 libnspr4 libnss3-tools libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
         libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 \
         libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 libxshmfence1 \
         libglib2.0-0 libgdk-pixbuf-2.0-0 xvfb xauth x11-utils ca-certificates curl \
-        wget gnupg \
+        wget gnupg chromium \
     && rm -rf /var/lib/apt/lists/*
 
 # Russian Trusted Root CA / Sub CA (Минцифры, НУЦ) — see Dockerfile for the
@@ -91,13 +94,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Provider launcher module (this repo).
 COPY src/ /opt/ceki/src/
 
-# Yandex Browser: the CORPORATE deb from the official repo. The repo only
-# serves the latest build, and newer Yandex versions (26.8+) have broken the
-# Ceki extension (extension never connects → rent stuck). The only known-good
-# version is the corporate 26.6.x (verified 2026-09-18 on ceki/provider:yandex-daemon-c266).
-# apt cannot pin an older version (repo doesn't keep them), so we HARD-FAIL the
-# build if the install resolves to anything but 26.6.* — never silently ship a
-# broken newer browser.
+# Yandex Browser: the CORPORATE deb from the official repo. Only the corporate
+# build honors extension policies (ExtensionInstallForcelist), so it is the
+# only flavor that can install our plugin. The repo only serves the latest
+# build: the old known-good 26.6.x has dropped out of the apt repo, so we pin
+# the current 26.8 line here. Verified 26.8.1 corporate: installs the Ceki
+# extension via forcelist and opens the CDP debugging port (unlike the earlier
+# 26.6 builds in our images). apt cannot pin an older version (repo doesn't
+# keep them), so we HARD-FAIL if the build resolves to anything but 26.8.* —
+# never silently ship a differently-versioned browser.
 RUN wget -qO- https://repo.yandex.ru/yandex-browser/YANDEX-BROWSER-KEY.GPG \
         | gpg --dearmor -o /usr/share/keyrings/yandex-browser.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/yandex-browser.gpg] https://repo.yandex.ru/yandex-browser/deb stable main" \
@@ -105,13 +110,14 @@ RUN wget -qO- https://repo.yandex.ru/yandex-browser/YANDEX-BROWSER-KEY.GPG \
     && apt-get update && apt-get install -y --no-install-recommends yandex-browser-corporate \
     && VER="$(yandex-browser --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)" \
     && echo "yandex-browser-corporate resolved to: $(yandex-browser --version 2>/dev/null)" \
-    && case "$VER" in 26.6) echo "OK: yandex 26.6 (known-good corporate build)";; *) echo "FATAL: yandex $VER != 26.6 — corporate 26.6 is the only build the extension supports. Do NOT ship this image."; exit 1;; esac \
+    && case "$VER" in 26.8) echo "OK: yandex 26.8 (corporate build, CDP works)";; *) echo "FATAL: yandex $VER != 26.8 — corporate 26.8 is the current supported build. Do NOT ship this image."; exit 1;; esac \
     && rm -rf /var/lib/apt/lists/*
 
-# Playwright's Chromium stays installed as a fallback binary (app.py falls back
-# with a warning if the Yandex binary is missing) and for the pseudo-yandex
-# style UA tooling.
-RUN python -m playwright install chromium
+# The real Yandex Browser (corporate 26.8) is the rented browser. The
+# system chromium above (apt) is the same full-CDP fallback binary the base
+# Dockerfile uses; app.py picks the binary per flavor.
+# No `playwright install chromium` — the bundled Playwright library drives
+# /usr/bin/chromium via executable_path (system Chromium, full CDP).
 
 # This image rents out the real Yandex Browser (settable at runtime; the
 # chromium image is the one to use for CEKI_PROVIDER_BROWSER=chromium).
