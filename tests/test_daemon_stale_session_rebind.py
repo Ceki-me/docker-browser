@@ -43,7 +43,11 @@ def make_spawner(max_sessions=4, connect_timeout="90"):
         cdps=[9200, 9201, 9202, 9203],
         displays=[101, 102, 103, 104],
     )
-    with patch.dict(os.environ, {"CEKI_DAEMON_CONNECT_TIMEOUT": connect_timeout}, clear=False):
+    with patch.dict(
+        os.environ,
+        {"CEKI_DAEMON_CONNECT_TIMEOUT": connect_timeout, "CEKI_DAEMON_BOOT_STAGGER_S": "0"},
+        clear=False,
+    ):
         return SpawnManager(cfg)
 
 
@@ -137,3 +141,42 @@ class TestMatchWsSkipsStaleInstance:
         matched = spawner.match_ws(ws)
 
         assert matched is ready, "ready instance with a live WS must be rebindable"
+
+
+class TestBootSlotResetsOnIdle:
+    """Fix 3: _boot_slot must reset when no instances are in flight.
+
+    Without the reset the stagger counter grows forever (slot 13 → 24s,
+    slot 14 → 26s, …) and a rent after idle sleeps that long BEFORE spawning,
+    while the extension's presence-WS waits on the same lock — the relay's
+    connect timeout fires and the rent is lost.
+    """
+
+    def test_boot_slot_resets_between_sequential_rents(self):
+        """ensure() resets the stagger to 0 when nothing is in flight, then
+        increments — a rent after idle starts at slot 1, not slot N+1."""
+        spawner = make_spawner()
+        with patch.object(spawner, "_spawn_and_handshake") as spawn_mock:
+            # First rent: slot 1.
+            assert spawner.ensure("a", {}) is not None
+            assert spawner._boot_slot == 1
+            spawner.destroy("a", "ended")
+            # Second rent immediately: still in-flight? no → reset then inc → 1.
+            assert spawner.ensure("b2", {}) is not None
+            assert spawner._boot_slot == 1, "sequential rents must not accumulate stagger"
+            spawner.destroy("b2", "ended")
+
+    def test_parallel_spawns_still_stagger(self):
+        """Concurrent in-flight instances keep staggering (no reset while busy)."""
+        spawner = make_spawner()
+        with patch.object(spawner, "_spawn_and_handshake"):
+            assert spawner.ensure("a", {}) is not None
+            assert spawner._boot_slot == 1
+            assert spawner.ensure("b", {}) is not None
+            assert spawner._boot_slot == 2, "parallel burst increments"
+            # 'a' ends while 'b' still spawning → slot must NOT reset.
+            spawner.destroy("a", "ended")
+            assert spawner.ensure("c", {}) is not None
+            assert spawner._boot_slot == 3, "must keep staggering while b is busy"
+            spawner.destroy("b", "ended")
+            spawner.destroy("c", "ended")

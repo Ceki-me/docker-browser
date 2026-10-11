@@ -658,6 +658,15 @@ class SpawnManager:
             if len(self._instances) >= self.cfg.max_sessions:
                 log.warning("session %s: max_sessions reached, denying spawn", session_id)
                 return None
+            # Reset the boot-stagger slot when the provider went idle: after a
+            # rent cycle the counter else grows unboundedly (slot 13 → 24s+,
+            # slot 14 → 26s+, …) and every subsequent rent eats an ever-longer
+            # sleep BEFORE spawning, while the extension's presence-WS waits on
+            # the same lock — the relay's connect timeout fires first and the
+            # rent is lost. Only the parallel-spawn case needs staggering, so
+            # reset whenever there is nothing else in flight.
+            if not self._instances:
+                self._boot_slot = 0
             key = self._storage_key_for(session_id, params)
             cdp = self.cfg.cdps.pop(0) if self.cfg.cdps else None
             disp = self.cfg.displays.pop(0) if self.cfg.displays else None
@@ -688,6 +697,9 @@ class SpawnManager:
         if self.cfg.max_sessions > 1 and boot_no > 1 and stagger > 0:
             delay = (boot_no - 1) * stagger
             log.info("ensure[%s]: boot stagger %ds (slot %d)", session_id, delay, boot_no)
+            # Sleep OUTSIDE the lock: with the delay holding self._lock, a slow
+            # stagger blocks match_ws() (also under the lock) — the extension
+            # can't bind while we're asleep and the relay times the rent out.
             time.sleep(delay)
         try:
             self._spawn_and_handshake(inst, params)
