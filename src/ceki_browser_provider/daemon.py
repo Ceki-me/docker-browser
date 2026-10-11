@@ -1190,8 +1190,19 @@ class SpawnManager:
         ws_open = ws is not None and getattr(ws, "state", None) == 1
         if not ws_open:
             log.warning("handshake: presence-WS not connected after handshake, relaunching run-phase Chrome once")
+            # Recreate BOTH Xvfb and Chrome: the first Xvfb may already be dead
+            # (live e2e: ConnectionRefusedError 111 on the CDP port because the
+            # first Xvfb/Chrome pair was torn down) and a Chrome on a dead
+            # display can never open the offscreen doc → presence-WS never
+            # comes up. A stale Xvfb is also what leaves the display/CDP slot
+            # occupied so the NEXT spawn has nothing to bind.
             self._kill_proc_group(proc2.pid)
             self._wait_exit(proc2.pid)
+            if inst.xvfb_pid and _pid_alive(inst.xvfb_pid):
+                self._kill_proc_group(inst.xvfb_pid)
+                self._wait_exit(inst.xvfb_pid)
+            xvfb2 = self._launch_xvfb(inst)
+            inst.xvfb_pid = xvfb2.pid
             proc2 = self._launch_chrome(inst, chrome_args)
             inst.chrome_pid = proc2.pid
             self._discover_ext_id(inst, timeout=30)
