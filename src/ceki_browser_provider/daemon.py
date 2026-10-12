@@ -2283,9 +2283,10 @@ class IdlePresenterThread:
     плагина (а не голый новый-таб / лого). todo repl: ренты на 151-153 не
     затрагиваются."""
 
-    def __init__(self) -> None:
+    def __init__(self, cfg: Any = None) -> None:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.cfg = cfg
 
     def start(self) -> None:
         if not os.environ.get("CEKI_DAEMON_IDLE_URL", "").strip():
@@ -2297,13 +2298,55 @@ class IdlePresenterThread:
     def stop_now(self) -> None:
         self._stop.set()
 
+    def _inject_idle_token(self, panel: Any) -> None:
+        """Write sanctum_token + ceki_browser + paired_at into the idle
+        extension's chrome.storage.local (mirror of Daemon._handshake_token),
+        so the panel leaves pairing mode and shows the connected state.
+
+        Without a configured token the panel stays on its setup/pairing screen.
+        Reuse the daemon's own cfg (CEKI_PROVIDER_TOKEN etc.). The write is
+        idempotent and a no-op when no token is configured."""
+        try:
+            if not self.cfg or not getattr(self.cfg, "token", ""):
+                log.info("idle-presenter: no cfg token, skipping token inject")
+                return
+            import time as _t
+            payload = {
+                "sanctum_token": self.cfg.token,
+                "ceki_browser": {
+                    "id": self.cfg.schedule_id or 0,
+                    "online": False,
+                    "name": provider_browser_name(),
+                    "flavor": provider_browser_flavor(),
+                },
+                "paired_at": int(_t.time() * 1000),
+                "incognito_available": True,
+                "auto_accept": True,
+            }
+            if getattr(self.cfg, "local_ws_url", ""):
+                payload["ceki_runtime_config"] = {"relay_ws": self.cfg.local_ws_url}
+            panel.evaluate(
+                "(async (p) => { await chrome.storage.local.set(p); "
+                "return JSON.stringify(await chrome.storage.local.get("
+                "['sanctum_token','paired_at','ceki_browser'])); })",
+                payload,
+            )
+            log.info("idle-presenter: token injected into idle extension storage")
+        except Exception as exc:
+            log.warning("idle-presenter: token inject failed: %s", exc)
+
     def _launch_once(self) -> None:
         import tempfile, time as _t, subprocess as _sp
         from playwright.sync_api import sync_playwright
         disp = os.environ.get("CEKI_DAEMON_IDLE_DISPLAY", "250")
         idle_url = os.environ.get("CEKI_DAEMON_IDLE_URL", "https://ceki.me")
         ext_dir = os.environ.get("CEKI_PROVIDER_EXT_DIR", "/opt/ceki/extension")
+        # Screen (Xvfb) stays FullHD; the page viewport is laptop-like 1600x1080
+        # (see app.py c43ca02): Playwright pins the page to 1280x720 when
+        # viewport is None, and the stream shows a narrow centered column even
+        # though the window is 1920x1080. version as in app.py idle fix.
         width = 1920; height = 1080
+        viewport_w, viewport_h = 1600, 1080
 
         # Поднять свой Xvfb на idle-дисплее, если его нет (сокет -> X-шар).
         os.makedirs("/tmp/.X11-unix", exist_ok=True)
@@ -2329,14 +2372,70 @@ class IdlePresenterThread:
         env = dict(os.environ); env["DISPLAY"] = f":{disp}"; os.environ["DISPLAY"] = f":{disp}"
         try:
             with sync_playwright() as p:
-                ctx = p.chromium.launch_persistent_context(
-                    profile, headless=False,
-                    args=["--no-sandbox","--disable-gpu","--disable-dev-shm-usage","--no-first-run",
-                          f"--load-extension={ext_dir}", f"--disable-extensions-except={ext_dir}",
-                          "--window-position=0,0", f"--window-size={width},{height}"],
-                    ignore_default_args=["--disable-extensions"],
-                    viewport=None, env=env,
-                )
+                # Install phase — launch once so Chromium registers the unpacked
+                # extension and writes the profile Preferences, then quit. Same
+                # two-launch pattern as app.py: without it the incognito flag in
+                # Preferences (written below) gets overwritten by Chromium on a
+                # single cold launch, and the side panel shows the red
+                # "Incognito mode disabled" blocker.
+                def _launch(load: bool):
+                    args = ["--no-sandbox","--disable-gpu","--disable-dev-shm-usage","--no-first-run",
+                            "--window-position=0,0", f"--window-size={width},{height}"]
+                    if load:
+                        args += [f"--load-extension={ext_dir}", f"--disable-extensions-except={ext_dir}"]
+                    return p.chromium.launch_persistent_context(
+                        profile, headless=False, args=args,
+                        ignore_default_args=["--disable-extensions"],
+                        # Explicit viewport — otherwise Playwright pins the page
+                        # to 1280x720 device-metrics and the stream shows a
+                        # narrow column (same fix as app.py idle: 1600x1080
+                        # laptop-like).
+                        viewport={"width": viewport_w, "height": viewport_h},
+                        env=env,
+                    )
+
+                install = _launch(True)
+                # Dalayed: let the SW register, then fully kill the browser so
+                # the run phase starts from a clean profile with our Prefs edit.
+                try:
+                    if install.service_workers:
+                        install.service_workers[0].evaluate("1 + 1")
+                except Exception:
+                    pass
+                install.close()
+                _t.sleep(2)
+
+                # Grant incognito access to the unpacked extension in this
+                # profile (mirrors app.py two-launch). Without it
+                # chrome.extension.isAllowedIncognitoAccess()==false and the
+                # side panel shows the red "Incognito mode disabled" blocker.
+                try:
+                    prefs_path = Path(profile) / "Default" / "Preferences"
+                    if prefs_path.exists():
+                        prefs = json.loads(prefs_path.read_text())
+                        settings = prefs.setdefault("extensions", {}).setdefault("settings", {})
+                        entry = settings.setdefault(_DEFAULT_EXT_ID, {})
+                        entry["incognito"] = True
+                        entry["state"] = 1
+                        prefs_path.write_text(json.dumps(prefs))
+                        log.info("idle-presenter: incognito granted in Preferences for %s", _DEFAULT_EXT_ID)
+                    else:
+                        log.warning("idle-presenter: Preferences not found at %s", prefs_path)
+                except Exception as exc:
+                    log.warning("idle-presenter: Preferences incognito edit failed: %s", exc)
+
+                ctx = _launch(True)
+                # SW-side: re-answer isAllowedIncognitoAccess(true) + refresh the
+                # storage flag the panel reads, so the blocker clears even if the
+                # Preferences grant didn't take effect on the current run.
+                if ctx.service_workers:
+                    try:
+                        sw = ctx.service_workers[0]
+                        sw.evaluate(provider_app._PATCH_INCOGNITO_JS)
+                        sw.evaluate(provider_app._PATCH_INCOGNITO_RECHECK_JS)
+                        log.info("idle-presenter: SW incognito patched")
+                    except Exception as exc:
+                        log.warning("idle-presenter: SW incognito patch failed: %s", exc)
                 # Открыть панель расширения (как legacy _open_panel).
                 panel = None
                 for path in ("panel/index.html", "panel.html", "popup.html"):
@@ -2357,15 +2456,42 @@ class IdlePresenterThread:
                     except Exception as exc:
                         log.warning("idle-presenter: seed failed: %s", exc)
                     # сайдбар
+                    # chrome.sidePanel.open() требует user gesture; вызов из
+                    # page.evaluate жестом НЕ является — promise резолвится, но
+                    # панель не открывается (лог «ok» был ложно-зелёным, виден
+                    # только рельс "can be sidebarred"). CDP Runtime.evaluate с
+                    # userGesture=True выполняет код как пользовательский жест.
                     try:
-                        panel.evaluate(
-                            "(async () => { const w = await chrome.windows.getCurrent(); "
-                            "if (!w || w.id === undefined) return 'ERR no-window'; "
-                            "await chrome.sidePanel.open({ windowId: w.id }); return 'ok window=' + w.id; })()"
-                        )
-                        log.info("idle-presenter: sidepanel open attempt ok")
+                        cdp = ctx.new_cdp_session(panel)
+                        res = cdp.send("Runtime.evaluate", {
+                            "expression": (
+                                "(async () => {"
+                                "  const w = await chrome.windows.getCurrent();"
+                                "  if (!w || w.id === undefined) return 'ERR no-window';"
+                                "  try {"
+                                "    await chrome.sidePanel.open({ windowId: w.id });"
+                                "    const lastErr = (chrome.runtime && chrome.runtime.lastError"
+                                "      && chrome.runtime.lastError.message) || '';"
+                                "    return 'ok window=' + w.id + ' lastError=' + lastErr;"
+                                "  } catch (e) {"
+                                "    return 'ERR ' + (e && e.message || e);"
+                                "  }"
+                                "})()"
+                            ),
+                            "awaitPromise": True,
+                            "userGesture": True,
+                            "returnByValue": True,
+                        })
+                        val = (res.get("result") or {}).get("value", "?")
+                        log.info("idle-presenter: sidepanel open: %s", val)
                     except Exception as exc:
                         log.warning("idle-presenter: sidepanel open failed: %s", exc)
+                    # Токен конфигурации idle-браузера: без него панель расширения
+                    # остаётся в режиме пейринга (не авторизована). Зеркалим
+                    # Daemon._handshake_token — пишем sanctum_token + ceki_browser
+                    # + relay_ws в chrome.storage.local через SW, чтобы присутствие
+                    # установилось и UI показал подключённое состояние.
+                    self._inject_idle_token(panel)
                     # максимум окна через CDP
                     try:
                         cdp = ctx.new_cdp_session(panel)
@@ -2450,7 +2576,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     daemon = Daemon(cfg)
     # idle-презентер: постоянный браузер на :250 с страницей (когда рент нет)
-    idle = IdlePresenterThread()
+    idle = IdlePresenterThread(cfg=cfg)
     idle.start()
     try:
         return daemon.run()
