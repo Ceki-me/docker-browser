@@ -1605,7 +1605,15 @@ class SpawnManager:
             except Exception as exc:
                 log.warning("cdp: CDP %s failed ws=%s : %r", method, ws_url, exc)
                 raise
-        return asyncio.run(_run())
+        # The bare `websockets.connect()` has NO open_timeout: under a parallel
+        # spawn (3rd+ concurrent Chrome) the extension SW can hang on accept, so
+        # connect()/send() spin past the 5s recv deadline forever — the daemon
+        # stalls inside _handshake and the watchdog reaps the rent (ev: CDP
+        # Runtime.evaluate timed out on chromium daemon 42306 at 3-way load).
+        # Wrap the WHOLE round-trip in one hard deadline so the caller's
+        # retry/refresh/relaunch path fires on schedule (as the fast-refusal
+        # comment below claims) instead of wedging on a silent partial-open.
+        return asyncio.run(asyncio.wait_for(_run(), timeout=timeout + 2.0))
 
     def _cdp_eval(self, ws_url: str, expression: str, timeout: float = 5.0) -> Any:
         """Evaluate ``expression`` in a CDP target via its webSocketDebuggerUrl."""
