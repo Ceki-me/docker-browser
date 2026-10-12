@@ -634,6 +634,23 @@ class SpawnManager:
         with self._lock:
             return dict(self._instances)
 
+    @staticmethod
+    def _connect_timeout_soft() -> float:
+        """Seconds after which a spawned-but-unconnected instance is considered stale.
+
+        Mirrors the watchdog's CEKI_DAEMON_CONNECT_TIMEOUT: once a spawn has had
+        this long to get its extension's presence-WS up and has not, treat it as
+        dead so match_ws() does not park the next rent's extension on it.
+
+        Default is 35s (NOT 90): the relay gives a rent roughly 40s before it
+        sends session_ended / times the connect out. Waiting the full 90s in
+        _retry_token_after_offscreen means the relay kills the rent first and
+        the daemon is still spinning — every 0-connect session we saw in live
+        e2e had exactly this shape (daemon waiting, relay already gone). The
+        daemon must reap/relaunch BEFORE the relay does.
+        """
+        return float(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "35"))
+
     def ensure(self, session_id: str, params: dict) -> Instance | None:
         """Return the live instance for ``session_id`` or spawn one.
 
@@ -648,6 +665,15 @@ class SpawnManager:
             if len(self._instances) >= self.cfg.max_sessions:
                 log.warning("session %s: max_sessions reached, denying spawn", session_id)
                 return None
+            # Reset the boot-stagger slot when the provider went idle: after a
+            # rent cycle the counter else grows unboundedly (slot 13 → 24s+,
+            # slot 14 → 26s+, …) and every subsequent rent eats an ever-longer
+            # sleep BEFORE spawning, while the extension's presence-WS waits on
+            # the same lock — the relay's connect timeout fires first and the
+            # rent is lost. Only the parallel-spawn case needs staggering, so
+            # reset whenever there is nothing else in flight.
+            if not self._instances:
+                self._boot_slot = 0
             key = self._storage_key_for(session_id, params)
             cdp = self.cfg.cdps.pop(0) if self.cfg.cdps else None
             disp = self.cfg.displays.pop(0) if self.cfg.displays else None
@@ -678,6 +704,9 @@ class SpawnManager:
         if self.cfg.max_sessions > 1 and boot_no > 1 and stagger > 0:
             delay = (boot_no - 1) * stagger
             log.info("ensure[%s]: boot stagger %ds (slot %d)", session_id, delay, boot_no)
+            # Sleep OUTSIDE the lock: with the delay holding self._lock, a slow
+            # stagger blocks match_ws() (also under the lock) — the extension
+            # can't bind while we're asleep and the relay times the rent out.
             time.sleep(delay)
         try:
             self._spawn_and_handshake(inst, params)
@@ -781,6 +810,20 @@ class SpawnManager:
             if session_id:
                 inst = self._instances.get(session_id)
                 if inst is not None:
+                    # Reconnect vs double-connect: if this instance ALREADY has
+                    # a live presence-WS, a second bind is a duplicate socket
+                    # from the same extension/SW — replacing it strands the old
+                    # handler (its read loop stays alive but is no longer the
+                    # owner → the old socket is never torn down and messages
+                    # double-route). Only rebind when the existing WS is dead
+                    # (None / CLOSED). Refuse the new socket otherwise; the
+                    # caller closes it.
+                    if inst.ws is not None and getattr(inst.ws, "state", 3) == 1:
+                        log.info(
+                            "match_ws: session %s already has a live WS — refusing duplicate bind",
+                            inst.session_id,
+                        )
+                        return None
                     inst.ws = ws
                     inst.ready = True
                     log.info("match_ws: by session_id %s -> inst %s", session_id, inst.session_id)
@@ -788,13 +831,43 @@ class SpawnManager:
                 log.info("match_ws: session_id %s not in active instances (%s)", session_id, list(self._instances))
             for inst in self._instances.values():
                 if inst.ws is None or inst.ws.state == 3:  # CLOSED
+                    # Only rebind an instance that is still waiting for its
+                    # extension (recently spawned, not ready). A dead instance
+                    # whose session ended while spawning (see _deliver
+                    # session.ended path) still sits here holding a free slot;
+                    # binding the NEXT rent's extension to it would strand the
+                    # new rent (stale-session rebind bug). Skip anything whose
+                    # extension-connect window has already expired.
+                    if inst.ws is None and not inst.ready:
+                        age = time.time() - inst.created_at
+                        if age > self._connect_timeout_soft():
+                            log.info(
+                                "match_ws: skip stale instance %s (age %.0fs, waiting for ext)",
+                                inst.session_id, age,
+                            )
+                            continue
                     inst.ws = ws
                     inst.ready = True
                     log.info("match_ws: first-free bind -> inst %s (query sid=%s)", inst.session_id, session_id)
                     return inst
-            # Overwrite: rebind the only instance (reconnect).
+            # Overwrite: rebind the only instance (reconnect). Same guard as the
+            # by-session path: never replace an OPEN ws (double-connect).
             if len(self._instances) == 1:
                 inst = next(iter(self._instances.values()))
+                if inst.ws is not None and getattr(inst.ws, "state", 3) == 1:
+                    log.info(
+                        "match_ws: only session %s already has a live WS — refusing duplicate bind",
+                        inst.session_id,
+                    )
+                    return None
+                if inst.ws is None and not inst.ready:
+                    age = time.time() - inst.created_at
+                    if age > self._connect_timeout_soft():
+                        log.info(
+                            "match_ws: skip stale only instance %s (age %.0fs, waiting for ext)",
+                            inst.session_id, age,
+                        )
+                        return None
                 inst.ws = ws
                 inst.ready = True
                 log.info("match_ws: overwrite-> inst %s (query sid=%s)", inst.session_id, session_id)
@@ -1116,9 +1189,34 @@ class SpawnManager:
         ws = getattr(inst, "ws", None)
         ws_open = ws is not None and getattr(ws, "state", None) == 1
         if not ws_open:
+            # The relay may have already closed this session while we were
+            # handshaking (session_ended → _deliver destroyed the instance).
+            # Relaunching a dead session occupies a display/CDP slot and races
+            # the next rent's spawn (live e2e: a destroyed session's Xvfb was
+            # relaunched at the same instant the next session spawned, both
+            # fell over). Only relaunch when the instance is still ours.
+            with self._lock:
+                still_alive = self._instances.get(inst.session_id) is inst
+            if not still_alive:
+                log.warning(
+                    "handshake: session %s destroyed while handshaking — skipping relaunch",
+                    inst.session_id,
+                )
+                return
             log.warning("handshake: presence-WS not connected after handshake, relaunching run-phase Chrome once")
+            # Recreate BOTH Xvfb and Chrome: the first Xvfb may already be dead
+            # (live e2e: ConnectionRefusedError 111 on the CDP port because the
+            # first Xvfb/Chrome pair was torn down) and a Chrome on a dead
+            # display can never open the offscreen doc → presence-WS never
+            # comes up. A stale Xvfb is also what leaves the display/CDP slot
+            # occupied so the NEXT spawn has nothing to bind.
             self._kill_proc_group(proc2.pid)
             self._wait_exit(proc2.pid)
+            if inst.xvfb_pid and _pid_alive(inst.xvfb_pid):
+                self._kill_proc_group(inst.xvfb_pid)
+                self._wait_exit(inst.xvfb_pid)
+            xvfb2 = self._launch_xvfb(inst)
+            inst.xvfb_pid = xvfb2.pid
             proc2 = self._launch_chrome(inst, chrome_args)
             inst.chrome_pid = proc2.pid
             self._discover_ext_id(inst, timeout=30)
@@ -1383,7 +1481,7 @@ class SpawnManager:
         write (or re-write) the token + relay config, then poll for the offscreen
         CDP target and finally wait for presence-WS — no removes.
         """
-        deadline = time.time() + int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90"))
+        deadline = time.time() + self._connect_timeout_soft()
         # 1. Ensure the token/config is set (idempotent — re-set refreshes the
         #    storage.onChanged trigger without tearing the SW down).
         re_set = 0
@@ -1413,7 +1511,7 @@ class SpawnManager:
             # 2. Give the SW a beat to create the offscreen document (which
             #    opens the presence-WS on token_updated).
             time.sleep(2.0)
-        log.warning("handshake: presence-WS did not connect within %ds", int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90")))
+        log.warning("handshake: presence-WS did not connect within %.0fs", self._connect_timeout_soft())
 
 
     def _find_target_ws(self, inst: Instance, kind: str, ext_id: str) -> str | None:
@@ -1820,6 +1918,22 @@ class ProviderWsClient:
                     "relay -> %s: instance %s not connected yet, dropping",
                     msg.get("type"), session_id,
                 )
+            if msg.get("type") in ("session_ended", "session.kill"):
+                # Relay closed the session before the extension connected
+                # (renter stop during spawn / backend reaper). The instance is
+                # dead — drop it NOW so it doesn't hold its CDP/display slot
+                # and, worse, doesn't attract a later extension via
+                # match_ws() "first-free" bind (stale-session rebind bug:
+                # rent#N+1's extension can bind to this dead instance and the
+                # new rent never gets an extension → relay times it out).
+                log.info(
+                    "relay -> %s: destroying %s (extension never connected)",
+                    msg.get("type"), session_id,
+                )
+                await asyncio.to_thread(
+                    self.spawner.destroy, session_id,
+                    "ended" if msg.get("type") == "session_ended" else "crashed",
+                )
             return
         try:
             await ws.send(json.dumps(msg))
@@ -2124,7 +2238,7 @@ class Daemon:
         Periodically reap instances that are older than the connect timeout and
         still not ``ready``.
         """
-        connect_timeout = int(os.environ.get("CEKI_DAEMON_CONNECT_TIMEOUT", "90"))
+        connect_timeout = int(self.spawner._connect_timeout_soft())
         while True:
             await asyncio.sleep(5)
             for session_id, inst in self.spawner.active().items():
