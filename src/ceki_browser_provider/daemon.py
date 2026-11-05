@@ -1544,13 +1544,34 @@ class SpawnManager:
         # HTTP 500 (and the storage handshake dies). Return the first target
         # whose WS-upgrade actually succeeds.
         import websockets.sync.client as _wscl
-        for t in reversed(candidates):
-            ws_url = t.get("webSocketDebuggerUrl") or ""
+        # The SW may appear in /json/list before its CDP target is ready —
+        # Chromium 154 answers HTTP 500 on WS-upgrade while the worker is
+        # still spinning up (the intermittent "extension never connected"
+        # flake: ~1 in 5 rents). open_timeout=1.0s was too short to wait out
+        # a slow SW boot and every candidate 500'd → token never landed →
+        # no presence-WS → black screen. Probe with a longer, retrying open so
+        # a slow-but-healthy SW is not mistaken for a dead one.
+        for attempt in range(3):
+            for t in reversed(candidates):
+                ws_url = t.get("webSocketDebuggerUrl") or ""
+                try:
+                    with _wscl.connect(ws_url, open_timeout=4.0, close_timeout=0.2):
+                        return ws_url
+                except Exception as exc:
+                    # Log once per round so the 500-vs-timeout cause is visible
+                    # in the daemon log instead of a silent `continue`.
+                    log.debug(
+                        "handshake: SW ws probe fail (%s): %s", type(exc).__name__, str(exc)[:120]
+                    )
+                    continue  # 500 / refused / stale — try next
+            # All candidates failed this round; a fresh SW generation may
+            # appear a moment later. Re-list and retry (bounded).
+            time.sleep(1.0)
             try:
-                with _wscl.connect(ws_url, open_timeout=1.0, close_timeout=0.2):
-                    return ws_url
+                candidates = [c for c in httpx.get(f"{cdp}/json/list", timeout=2).json()
+                              if c.get("type") == kind and f"chrome-extension://{ext_id}/" in (c.get("url") or "")]
             except Exception:
-                continue  # 500 / refused / stale — try next
+                pass
         # No WS-connectable candidate. Do NOT fall back to a dead target:
         # storage.set there answers 500 and the handshake stalls. Return None
         # so the caller keeps polling — a healthy worker appears a moment
