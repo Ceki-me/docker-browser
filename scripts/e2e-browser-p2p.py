@@ -117,6 +117,25 @@ PAGE_SNIPPET = r"""
     });
     out.wsConnected = true;
 
+    // 3.5 Pre-fetch TURN/STUN from /api/ice-servers (same as the web front's
+    // useCekiSdkP2P.js does) and push them into the SDK BEFORE rent. Without
+    // TURN, STUN-only ICE cannot traverse the provider's NAT (its private
+    // host candidates are filtered) and P2P silently falls back to WS.
+    let iceServersFromApi = [];
+    try {
+      const ir = await fetch(__API_URL__ + '/ice-servers', {
+        headers: { Authorization: 'Bearer ' + token },
+      });
+      if (ir.ok) {
+        const ij = await ir.json();
+        if (Array.isArray(ij.iceServers) && ij.iceServers.length > 0) {
+          iceServersFromApi = ij.iceServers;
+          if (typeof client.setIceServers === 'function') client.setIceServers(ij.iceServers);
+        }
+      }
+    } catch (e) { out.icePrefetchError = String(e.message || e); }
+    out.iceServersPrefetched = iceServersFromApi.map(s => (s.urls || [])[0]);
+
     // 4. rent the schedule -> P2P transport should initialize and open cmd DC
     const t0 = Date.now();
     const browser = await client.rent(__BROWSER_ID__, {});
@@ -190,8 +209,8 @@ PAGE_SNIPPET = r"""
     } catch (e) { out.clickError = String(e.message || e).slice(0, 200); }
 
     // Custom canvas-style input ({type:'mouse'}) — exactly what the web UI
-    // sends via sendInput. Verifies this path lands in the BROWSER transport
-    // (the Node SDK in e2e probes was losing these; see investigation).
+    // sends via sendInput. The SDK converts it to CDP Input.dispatchMouseEvent
+    // and routes it through the session's chosen transport (P2P DC or WS).
     try {
       const t3 = Date.now();
       await browser.send({ method: 'Runtime.evaluate', params: { expression: 'window.__c2=0; document.addEventListener("click",()=>{window.__c2++;}); "ok"' } }, 30000);
@@ -352,7 +371,7 @@ async def main() -> None:
         ok = verdict(r)
         if not ok:
             fails += 1
-        keys = ["sessionId", "rentMs", "p2pInitialized", "cmdDcOpen", "navigateOk", "evalTitle", "clickMs", "evalMs", "sendInputLanded", "sendInputMs", "screenshotBytes"]
+        keys = ["sessionId", "rentMs", "p2pInitialized", "cmdDcOpen", "navigateOk", "evalTitle", "clickMs", "evalMs", "sendInputLanded", "sendInputMs", "iceServersPrefetched", "screenshotBytes"]
         print(
             f"  {'PASS' if ok else 'FAIL'} #{i} " + " ".join(
                 f"{k}={r.get(k)}" for k in keys if k in r
