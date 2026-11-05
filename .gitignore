@@ -31,3 +31,6 @@ Dockerfile.dev-daemon-overlay
 
 # Local persist-profile bind dir (real Chrome profiles, never commit).
 .persist-sessions/
+
+# Local agent scratch (logs/done markers) — never commit.
+.background/
