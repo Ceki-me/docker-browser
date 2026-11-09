@@ -8,15 +8,14 @@ Each successful signup exports a working profile (cookies + localStorage +
 sessionStorage) into <DEEPSEEK_PROFILE_DIR>/signup-<ts>/, so the account can
 be resumed/logged in later.
 
-Disposable email: uses mailticking.com via its internal API. Because the
-host egress IP is a datacenter (Cloudflare blocks it), the mailticking API is
-called through a residential/RU proxy — pass CEKI_PROXY_URL (http://user:pass@host:port).
-The rented RU browser also exits through that proxy (provider env), so both
-DeepSeek and mailticking see a consistent RU IP.
+Disposable email: uses mailticking.com via its internal API, reached through
+the outbound proxy in CEKI_PROXY_URL (mailticking blocks datacenter egress IPs
+with Cloudflare 403; a residential/RU proxy passes). Set CEKI_PROXY_URL to the
+same proxy the rented provider uses so the mailbox session is primed.
 
 Flow:
-  1. rent a browser (RU schedule by default; provider must egress via the proxy)
-  2. get a disposable address from mailticking (through the proxy)
+  1. rent a browser (schedule from --schedule)
+  2. get a disposable address from mailticking
   3. open chat.deepseek.com/sign_up
   4. fill Email address / Password / Confirm password
   5. click "Send code" (DeepSeek emails a 6-digit code)
@@ -24,18 +23,22 @@ Flow:
   7. enter the code, confirm, land in the chat
   8. export the working profile (cookies+storage) + screenshot to a per-run dir
 
-Known env-detection blocker (task 14652/14654): DeepSeek can reject with
-"Current device environment error" when WebRTC exposes the docker bridge IP
-(172.x) or tz/locale mismatch the geo. The script prints a diagnostic probe
-(WebRTC candidates + timezone + language) so the report includes the exact
-signature, and still exports whatever profile exists.
+Known blockers:
+- hCaptcha: DeepSeek drops an hCaptcha iframe the moment "Send code" is
+  clicked when it suspects automation or a disposable mailbox; the code is not
+  sent until the challenge is solved. The script reports the page state after
+  the click so the run shows which blocker fired. Automated signup therefore
+  currently stops at step 5/6.
+- env detection (task 14652/14654): DeepSeek can reject with "Current device
+  environment error" when WebRTC exposes the docker bridge IP (172.x) or
+  tz/locale mismatch the geo. The script prints a diagnostic probe (WebRTC
+  candidates + timezone + language) so the report includes the exact signature.
 
 No internal endpoints/tokens hardcoded — everything from env (public repo).
 
 Run:
   CEKI_AGENT_TOKEN=<ag_...> \
-  CEKI_PROXY_URL=http://user:pass@host:port \
-  python3 scripts/deepseek_signup.py [--schedule 43666] [--count 3]
+  python3 scripts/deepseek_signup.py [--schedule 42304] [--count 3]
 
 Optional env:
   DEEPSEEK_PROFILE_DIR   where per-run profile folders go (default ./deepseek-profiles)
@@ -62,10 +65,10 @@ API = os.environ.get("CEKI_API_URL", "https://api.ceki.me")
 RELAY = os.environ.get("CEKI_RELAY_URL", "wss://browser.ceki.me/ws/agent")
 CHAT = os.environ.get("CEKI_CHAT_URL", "https://chat.ceki.me/api/chat")
 PROFILE_DIR = os.environ.get("DEEPSEEK_PROFILE_DIR", "deepseek-profiles")
-PROXY_URL = os.environ.get("CEKI_PROXY_URL", "")  # http://user:pass@host:port
 
 import ceki_sdk
 
+_PROXY_URL = os.environ.get("CEKI_PROXY_URL", "")  # optional http://user:pass@host:port
 _CODE_RE = re.compile(r"(\b\d{6}\b)")
 MAILTICKING_BASE = "https://www.mailticking.com"
 _CONFIRM_BTN = (
@@ -90,8 +93,8 @@ class MailTicking:
         if self._opener is None:
             self._cj = CookieJar()
             handlers: list = [urllib.request.HTTPCookieProcessor(self._cj)]
-            if PROXY_URL:
-                handlers.append(urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL}))
+            if _PROXY_URL:
+                handlers.append(urllib.request.ProxyHandler({"http": _PROXY_URL, "https": _PROXY_URL}))
             self._opener = urllib.request.build_opener(*handlers)
         url = MAILTICKING_BASE + path
         h = {"User-Agent": self.UA, "Accept": "application/json", "Content-Type": "application/json",
@@ -108,6 +111,9 @@ class MailTicking:
 
     def new_address(self) -> str:
         """Create a disposable address; returns the email. Activate + fetch data-code."""
+        # Prime the session (cookies + homepage) before requesting a mailbox,
+        # otherwise data-code is not populated after activation.
+        self._open("/")
         status, body = self._open("/get-mailbox", {"types": ["1", "2", "3", "4"]})
         if status != 200:
             raise RuntimeError(f"mailticking get-mailbox HTTP {status}: {body[:200]}")
@@ -122,6 +128,41 @@ class MailTicking:
         m = re.search(r'data-code="([^"]+)"', body)
         self._code = m.group(1) if m else ""
         return self._email
+
+    def _activate_and_fetch_code(self) -> None:
+        status, body = self._open("/")
+        m = re.search(r'data-code="([^"]+)"', body)
+        self._code = m.group(1) if m else ""
+
+    def gmail_address(self, max_attempts: int = 8) -> str:
+        """Keep generating/switching mailticking addresses until a Gmail one
+        comes up (DeepSeek reliably delivers to @gmail.com/@googlemail.com).
+
+        The mailbox-type checkboxes that yield Gmail are types 1/2/3
+        (verified live: types=["1"]→@gmail.com, ["2"]→@gmail.com,
+        ["3"]→@googlemail.com, ["1","2","3"]→@gmail.com). type 4 yields
+        non-Gmail domains, so it is excluded.
+        """
+        for attempt in range(max_attempts):
+            if attempt == 0:
+                status, body = self._open("/")  # prime cookies
+                status, body = self._open("/get-mailbox", {"types": ["1", "2", "3"]})
+            else:
+                status, body = self._open("/change-mailbox", {"oldMail": self._email, "code": self._code, "type": random.choice(["1", "2", "3"])})
+            if status != 200:
+                continue
+            d = json.loads(body)
+            if not d.get("success") or not d.get("email"):
+                continue
+            self._email = d["email"]
+            token = d.get("activate_token", "")
+            if token:
+                self._open("/activate-email", {"email": self._email, "source": "homepage", "activate_token": token})
+            self._activate_and_fetch_code()
+            if self._email.lower().endswith(("@gmail.com", "@googlemail.com")):
+                return self._email
+            print(f"[ds-signup] mailticking not-gmail, switching ({attempt + 1}/{max_attempts})")
+        raise RuntimeError("mailticking: no Gmail address after %d attempts" % max_attempts)
 
     async def poll_code(self, timeout: float = 180, poll_interval: float = 5) -> str:
         deadline = asyncio.get_event_loop().time() + timeout
@@ -205,8 +246,8 @@ async def run_one(client, args) -> int:
     sid = None
     try:
         mt = MailTicking()
-        email_addr = mt.new_address()
-        print(f"[ds-signup] mailticking addr={email_addr}")
+        email_addr = mt.gmail_address()
+        print(f"[ds-signup] mailticking gmail addr={email_addr}")
 
         browser = await asyncio.wait_for(client.rent(args.schedule, mode="incognito", fingerprint=True), timeout=90)
         sid = browser.session_id
@@ -223,8 +264,11 @@ async def run_one(client, args) -> int:
         print(f"[ds-signup] fill: {await ev(browser, fill_expr(email_addr, pwd))}")
         await asyncio.sleep(1)
         print(f"[ds-signup] send: {await ev(browser, SEND_CODE)}")
+        await asyncio.sleep(4)
+        post_send_txt = (await ev(browser, "document.body.innerText.slice(0,1200)") or "").replace("\n", " | ")
+        print(f"[ds-signup] post-send page: {post_send_txt[:400]}")
 
-        code = await mt.poll_code()
+        code = await mt.poll_code(timeout=60, poll_interval=3)
         print(f"[ds-signup] got code={code}")
         enter_code = f"""(()=>{{
           const inputs=[...document.querySelectorAll('input')].filter(i=>i.type==='text'||i.type==='tel'||!i.type);
@@ -265,8 +309,6 @@ async def main(args):
     tok = os.environ.get("CEKI_AGENT_TOKEN", "")
     if not tok:
         sys.exit("CEKI_AGENT_TOKEN not set")
-    if not PROXY_URL:
-        print("WARN: CEKI_PROXY_URL not set — mailticking will likely be blocked from a datacenter IP")
     client = ceki_sdk.Client(tok, relay_url=RELAY, api_url=API, chat_url=CHAT, reconnect=False)
     await client._connect()
     fails = 0
@@ -287,7 +329,7 @@ async def main(args):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--schedule", type=int, default=int(os.environ.get("DEEPSEEK_SCHEDULE", "43666")))
+    ap.add_argument("--schedule", type=int, default=int(os.environ.get("DEEPSEEK_SCHEDULE", "42304")))
     ap.add_argument("--count", type=int, default=1)
     ap.add_argument("--password", default="")
     args = ap.parse_args()
