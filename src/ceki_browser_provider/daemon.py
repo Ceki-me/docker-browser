@@ -607,6 +607,27 @@ def _procs_with_display(display: int) -> list[tuple[int, str]]:
     return found
 
 
+def _idle_chrome_ticks(profile_dir: str) -> dict[int, tuple[int, int]]:
+    """Sum utime+stime (jiffies) of every Chromium process whose
+    ``--user-data-dir`` is under ``profile_dir``. Used by the idle-presenter
+    watchdog to catch a stuck renderer that burns CPU forever."""
+    ticks: dict[int, tuple[int, int]] = {}
+    for pid, data in _cmdlines():
+        if "user-data-dir" not in data or profile_dir not in data:
+            continue
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text().split()
+        except Exception:
+            continue
+        try:
+            # Fields: pid(1) comm(2) state(3) ppid(4) ... utime(14) stime(15).
+            ut, st = int(stat[13]), int(stat[14])
+        except (IndexError, ValueError):
+            continue
+        ticks[int(pid)] = (ut, st)
+    return ticks
+
+
 class SpawnManager:
     """Process manager + spawner. Interface mirrors the spec's SpawnManager:
 
@@ -2527,9 +2548,57 @@ class IdlePresenterThread:
                         log.info("idle-presenter: idle page shown: %s", idle_url)
                     except Exception as exc:
                         log.warning("idle-presenter: goto failed: %s", exc)
-                while not self._stop.is_set():
-                    _t.sleep(3)
-                ctx.close()
+                # Watchdog: без него залипший renderer (бесконечный JS-цикл на
+                # idle-странице) живёт вечно и молотит CPU, пока контейнер не
+                # перезапустят руками. Процесс при этом жив — исключения нет,
+                # поэтому старый `while sleep(3)` никогда не перезапускал его.
+                # Держим рендер под контролем: TTL (профилактический
+                # перезапуск) + watch по CPU. Зависший main thread не отвечает
+                # на evaluate/CDP — единственный надёжный сигнал залипания это
+                # стабильно-высокий CPU, поэтому меряем именно его.
+                idle_ttl_s = int(os.environ.get("CEKI_DAEMON_IDLE_TTL", "21600"))  # 6h
+                cpu_watch_s = int(os.environ.get("CEKI_DAEMON_IDLE_CPU_WATCH", "30"))
+                cpu_budget = float(os.environ.get("CEKI_DAEMON_IDLE_CPU_BUDGET", "0.75"))  # 75% одного ядра
+                started = _t.monotonic()
+                last_cpu_check = started
+                last_cpu_tick = {}
+                try:
+                    while not self._stop.is_set():
+                        _t.sleep(3)
+                        now = _t.monotonic()
+                        # TTL — плановая ротация idle-браузера.
+                        if now - started > idle_ttl_s:
+                            log.info("idle-presenter: TTL %ss истёк — перезапуск", idle_ttl_s)
+                            break
+                        # CPU-watch: каждый cpu_watch_s замеряем utime+stime всех
+                        # процессов нашего profile dir. Залипший renderer жрёт
+                        # >100% ядра стабильно — ловим и рестартуем.
+                        if now - last_cpu_check >= cpu_watch_s:
+                            prev_check = last_cpu_check
+                            last_cpu_check = now
+                            ticks = _idle_chrome_ticks(profile)
+                            if ticks:
+                                deltas = {
+                                    pid: (ut, st) - last_cpu_tick.get(pid, (ut, st))
+                                    for pid, (ut, st) in ticks.items()
+                                }
+                                last_cpu_tick = ticks
+                                # Доля ядра = (дельты jiffies) / (прошло тиков ядра).
+                                # Первый проход: last_cpu_tick пуст — дельты 0,
+                                # только фиксируем baseline, не рестартуем.
+                                jiffies = sum(ut + st for ut, st in deltas.values())
+                                elapsed_jiffies = (now - prev_check) * os.sysconf("SC_CLK_TCK")
+                                if elapsed_jiffies > 0 and jiffies / elapsed_jiffies > cpu_budget:
+                                    log.warning(
+                                        "idle-presenter: CPU-budget exceeded (%.0f%% ядра) — рестарт",
+                                        100 * jiffies / elapsed_jiffies,
+                                    )
+                                    break
+                finally:
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
         finally:
             pass
 
