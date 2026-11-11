@@ -607,6 +607,43 @@ def _procs_with_display(display: int) -> list[tuple[int, str]]:
     return found
 
 
+class _PopenHandle:
+    """Minimal ``subprocess.Popen``-like handle for a process we did NOT spawn.
+
+    Used by the Xvfb adoption path: the display is already owned by a live
+    host-side Xvfb, so we return a handle carrying its real pid instead of
+    starting our own. Only ``.pid`` is consumed by the daemon
+    (``inst.xvfb_pid = xvfb.pid`` → ``_kill_proc_group``/``_wait_exit``), but
+    poll/wait/terminate/kill are provided for parity with the spawn path.
+    """
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+
+    def poll(self) -> int | None:
+        return None if _pid_alive(self.pid) else self.pid
+
+    def wait(self, timeout: float = 15.0) -> int:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not _pid_alive(self.pid):
+                break
+            time.sleep(0.5)
+        return self.pid
+
+    def send_signal(self, sig: int) -> None:
+        try:
+            os.kill(self.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def terminate(self) -> None:
+        self.send_signal(signal.SIGTERM)
+
+    def kill(self) -> None:
+        self.send_signal(signal.SIGKILL)
+
+
 class SpawnManager:
     """Process manager + spawner. Interface mirrors the spec's SpawnManager:
 
@@ -1026,7 +1063,7 @@ class SpawnManager:
                 pid = ext[0][0]
                 log.info("xvfb: adopting host Xvfb on :%d (pid %s)", inst.display, pid)
                 env = dict(os.environ)
-                return _Popen_handle(pid=pid)
+                return _PopenHandle(pid=pid)
             # xwininfo answered but NO process actually owns this display
             # (transient/stale probe success — seen as "adopting host Xvfb on
             # :142 (pid -1)", which left rentals with NO X server → Chrome
