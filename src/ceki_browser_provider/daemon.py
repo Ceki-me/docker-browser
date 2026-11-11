@@ -2578,10 +2578,10 @@ class IdlePresenterThread:
                             last_cpu_check = now
                             ticks = _idle_chrome_ticks(profile)
                             if ticks:
-                                deltas = {
-                                    pid: (ut, st) - last_cpu_tick.get(pid, (ut, st))
-                                    for pid, (ut, st) in ticks.items()
-                                }
+                                deltas = {}
+                                for pid, (ut, st) in ticks.items():
+                                    pu, ps = last_cpu_tick.get(pid, (ut, st))
+                                    deltas[pid] = (ut - pu, st - ps)
                                 last_cpu_tick = ticks
                                 # Доля ядра = (дельты jiffies) / (прошло тиков ядра).
                                 # Первый проход: last_cpu_tick пуст — дельты 0,
