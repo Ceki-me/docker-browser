@@ -607,27 +607,6 @@ def _procs_with_display(display: int) -> list[tuple[int, str]]:
     return found
 
 
-def _idle_chrome_ticks(profile_dir: str) -> dict[int, tuple[int, int]]:
-    """Sum utime+stime (jiffies) of every Chromium process whose
-    ``--user-data-dir`` is under ``profile_dir``. Used by the idle-presenter
-    watchdog to catch a stuck renderer that burns CPU forever."""
-    ticks: dict[int, tuple[int, int]] = {}
-    for pid, data in _cmdlines():
-        if "user-data-dir" not in data or profile_dir not in data:
-            continue
-        try:
-            stat = Path(f"/proc/{pid}/stat").read_text().split()
-        except Exception:
-            continue
-        try:
-            # Fields: pid(1) comm(2) state(3) ppid(4) ... utime(14) stime(15).
-            ut, st = int(stat[13]), int(stat[14])
-        except (IndexError, ValueError):
-            continue
-        ticks[int(pid)] = (ut, st)
-    return ticks
-
-
 class SpawnManager:
     """Process manager + spawner. Interface mirrors the spec's SpawnManager:
 
@@ -2552,48 +2531,43 @@ class IdlePresenterThread:
                 # idle-странице) живёт вечно и молотит CPU, пока контейнер не
                 # перезапустят руками. Процесс при этом жив — исключения нет,
                 # поэтому старый `while sleep(3)` никогда не перезапускал его.
-                # Держим рендер под контролем: TTL (профилактический
-                # перезапуск) + watch по CPU. Зависший main thread не отвечает
-                # на evaluate/CDP — единственный надёжный сигнал залипания это
-                # стабильно-высокий CPU, поэтому меряем именно его.
+                # Зависший main thread НЕ отвечает на Runtime.evaluate: CDP
+                # возвращает ошибку по серверному `timeout` — это надёжный
+                # сигнал залипания. Прожорливый, но живой renderer (ceki.me
+                # грузит >100% CPU штатно) отвечает — его не трогаем, поэтому
+                # CPU-замер тут не используется (ловил бы живую страницу).
                 idle_ttl_s = int(os.environ.get("CEKI_DAEMON_IDLE_TTL", "21600"))  # 6h
-                cpu_watch_s = int(os.environ.get("CEKI_DAEMON_IDLE_CPU_WATCH", "30"))
-                cpu_budget = float(os.environ.get("CEKI_DAEMON_IDLE_CPU_BUDGET", "0.75"))  # 75% одного ядра
+                probe_interval_s = int(os.environ.get("CEKI_DAEMON_IDLE_PROBE_INTERVAL", "30"))
+                probe_timeout_ms = int(os.environ.get("CEKI_DAEMON_IDLE_PROBE_TIMEOUT_MS", "10000"))
                 started = _t.monotonic()
-                last_cpu_check = started
-                last_cpu_tick = {}
+                last_probe = started
+                # Одна CDP-сессия на весь цикл: не плодим новые каждые
+                # probe_interval_s (утечка сессий). Если сессия умерла —
+                # send() бросит, это и есть сигнал рестарта.
+                probe_cdp = ctx.new_cdp_session(panel)
                 try:
                     while not self._stop.is_set():
                         _t.sleep(3)
                         now = _t.monotonic()
-                        # TTL — плановая ротация idle-браузера.
+                        # TTL — плановая ротация idle-браузера (страховка от
+                        # медленного накопления состояния в любом виде).
                         if now - started > idle_ttl_s:
                             log.info("idle-presenter: TTL %ss истёк — перезапуск", idle_ttl_s)
                             break
-                        # CPU-watch: каждый cpu_watch_s замеряем utime+stime всех
-                        # процессов нашего profile dir. Залипший renderer жрёт
-                        # >100% ядра стабильно — ловим и рестартуем.
-                        if now - last_cpu_check >= cpu_watch_s:
-                            prev_check = last_cpu_check
-                            last_cpu_check = now
-                            ticks = _idle_chrome_ticks(profile)
-                            if ticks:
-                                deltas = {}
-                                for pid, (ut, st) in ticks.items():
-                                    pu, ps = last_cpu_tick.get(pid, (ut, st))
-                                    deltas[pid] = (ut - pu, st - ps)
-                                last_cpu_tick = ticks
-                                # Доля ядра = (дельты jiffies) / (прошло тиков ядра).
-                                # Первый проход: last_cpu_tick пуст — дельты 0,
-                                # только фиксируем baseline, не рестартуем.
-                                jiffies = sum(ut + st for ut, st in deltas.values())
-                                elapsed_jiffies = (now - prev_check) * os.sysconf("SC_CLK_TCK")
-                                if elapsed_jiffies > 0 and jiffies / elapsed_jiffies > cpu_budget:
-                                    log.warning(
-                                        "idle-presenter: CPU-budget exceeded (%.0f%% ядра) — рестарт",
-                                        100 * jiffies / elapsed_jiffies,
-                                    )
-                                    break
+                        # Probe отзывчивости через CDP Runtime.evaluate с
+                        # серверным таймаутом. Зависший renderer не вернёт
+                        # ответ — CDP вернёт ошибку за timeout мс, рестартим.
+                        if now - last_probe >= probe_interval_s:
+                            last_probe = now
+                            try:
+                                probe_cdp.send("Runtime.evaluate", {
+                                    "expression": "1 + 1",
+                                    "returnByValue": True,
+                                    "timeout": probe_timeout_ms,
+                                })
+                            except Exception:
+                                log.warning("idle-presenter: page unresponsive — рестарт")
+                                break
                 finally:
                     try:
                         ctx.close()
