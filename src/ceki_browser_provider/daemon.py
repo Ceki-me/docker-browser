@@ -2371,8 +2371,18 @@ class IdlePresenterThread:
 
         # Поднять свой Xvfb на idle-дисплее, если его нет (сокет -> X-шар).
         os.makedirs("/tmp/.X11-unix", exist_ok=True)
-        # Пересоздаём Xvfb на idle-дисплее начисто: старый сокет/лок от прежнего
-        # презентера мог остаться, и Xvfb умирает при старте (не может bind).
+        # Пересоздаём Xvfb на idle-дисплее начисто. Удалить только файл сокета
+        # и лок НЕ достаточно: старый живой Xvfb продолжает держать bind —
+        # abstract-socket @/tmp/.X11-unix/X{disp} (после unlink файловый путь
+        # недоступен снаружи через X-шар, но bind на abstract занят). Новый
+        # Xvfb тогда не может прибиндиться и НЕ создаёт файловый сокет в
+        # /tmp/.X11-unix — ceki-rtmp видит "inode none" и стрим уходит на
+        # standby-лого. Поэтому гасим старый Xvfb по PID (SIGKILL) до старта.
+        for _pid, _cmd in _procs_with_display(int(disp)):
+            try:
+                os.kill(_pid, signal.SIGKILL)
+            except OSError:
+                pass
         try:
             os.unlink(f"/tmp/.X11-unix/X{disp}")
         except OSError:
