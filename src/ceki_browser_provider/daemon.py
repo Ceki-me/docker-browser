@@ -662,6 +662,15 @@ class SpawnManager:
         self._patch_stamp: str | None = None
         self._swept = False
         self._boot_slot = 0
+        # session_id -> unix ts of its last destroy(). Guards the relay's
+        # double-match window: right after session_ended, the relay can still
+        # deliver a second match for the SAME sid (renter's re-rent lands
+        # before the old session is fully gone). Spawning a fresh pair at that
+        # instant orphans it — no second session_ended ever arrives to close
+        # it (relay considers the sid already ended), the watchdog skips it
+        # (extension connects fine -> ready), and the Chrome leaks, holding a
+        # CDP/display slot for the next rent. See test_daemon_relaunch_destroy_race.
+        self._recently_ended: dict[str, float] = {}
         self._captures: list[Any] = []
         self._captures_stop: list[threading.Event] = []
 
@@ -670,6 +679,26 @@ class SpawnManager:
     def active(self) -> dict[str, Instance]:
         with self._lock:
             return dict(self._instances)
+
+    def _prune_recently_ended(self, now: float | None = None) -> None:
+        """Drop gone-ended marks older than the double-match guard window.
+
+        Caller MUST hold ``self._lock`` (callers are inside ``with self._lock``).
+        """
+        now = time.time() if now is None else now
+        cutoff = now - self._respawn_guard_s()
+        stale = [s for s, ts in self._recently_ended.items() if ts < cutoff]
+        for s in stale:
+            del self._recently_ended[s]
+
+    @staticmethod
+    def _respawn_guard_s() -> float:
+        """Cooldown after destroy() during which a relay double-match for the
+        same sid is NOT re-spawned. The relay can deliver a second match right
+        after session_ended (instant re-rent); spawning then orphans a Chrome
+        pair, so hold spawns until the relay has fully closed the sid.
+        """
+        return float(os.environ.get("CEKI_DAEMON_RESPAWN_GUARD_S", "8"))
 
     @staticmethod
     def _connect_timeout_soft() -> float:
@@ -699,6 +728,17 @@ class SpawnManager:
             inst = self._instances.get(session_id)
             if inst is not None:
                 return inst
+            # Relay double-match after session_ended: the old sid is still in
+            # the respawn-guard window — do NOT spawn an orphan pair that no
+            # second session_ended will ever close. Let the renter retry (SDK
+            # re-rents on connect failure) once the window has elapsed.
+            self._prune_recently_ended()
+            if session_id in self._recently_ended:
+                log.info(
+                    "session %s: respawn guard (recently ended) — denying spawn",
+                    session_id,
+                )
+                return None
             if len(self._instances) >= self.cfg.max_sessions:
                 log.warning("session %s: max_sessions reached, denying spawn", session_id)
                 return None
@@ -756,6 +796,12 @@ class SpawnManager:
     def destroy(self, session_id: str, reason: str) -> None:
         with self._lock:
             inst = self._instances.pop(session_id, None)
+        # Remember the end so a relay double-match (resume within the
+        # post-close window) does not re-spawn an orphan pair. Prune old
+        # entries opportunistically to keep the map bounded.
+        with self._lock:
+            self._prune_recently_ended()
+            self._recently_ended[session_id] = time.time()
         if inst is None:
             return
         # Stop any debug-capture manager bound to this instance's CDP port.
@@ -1258,6 +1304,22 @@ class SpawnManager:
             inst.chrome_pid = proc2.pid
             self._discover_ext_id(inst, timeout=30)
             self._handshake(inst)
+            # The relaunch's own handshake is slow (up to ~40s of CDP retries),
+            # so session_ended can land AGAIN while we are inside it — the
+            # first still_alive check above is already stale by then. If the
+            # instance was destroyed meanwhile, kill the just-relaunched pair
+            # so it doesn't orphan a Chrome that holds a CDP/display slot and
+            # wedges the next rent's spawn (live e2e: sequential rents leaked
+            # one browser per cycle).
+            with self._lock:
+                still_alive = self._instances.get(inst.session_id) is inst
+            if not still_alive:
+                log.warning(
+                    "handshake: session %s destroyed during relaunch handshake — reaping relaunched pair",
+                    inst.session_id,
+                )
+                self._kill_group(inst)
+                return
         # 6) opportunistic: drop Yandex's default background tabs (ya.ru,
         #    chrome://wallpaper, alissenger) that eat ~1GB on an idle rent.
         #    Deferred so the extension's session tab (about:blank) opens first;
