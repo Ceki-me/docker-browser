@@ -336,6 +336,16 @@ async def run_once(idx: int) -> dict:
         if console_log:
             result = dict(result or {})
             result["p2pDiagLog"] = console_log
+            # ev 16913 / js#31 py#35 — cold-start retry guard. The transport
+            # rebuilds the pc on a 15s cadence and re-issues the offer; a late
+            # webrtc.answer from the previous offer can land on the new pc
+            # while it is already 'stable', which used to throw InvalidStateError.
+            # #31/#35 ignore the stale answer. Assert the guard fired (and that
+            # it never let an InvalidStateError escape) so a regression in the
+            # fix fails this e2e.
+            joined = "\n".join(str(x) for x in console_log)
+            result["staleAnswerGuard"] = "stale answer ignored" in joined
+            result["invalidStateError"] = "InvalidStateError" in joined
         return {"idx": idx, **(result or {})}
 
 
@@ -349,6 +359,11 @@ def verdict(r: dict) -> bool:
     if not r.get("navigateOk"):
         return False
     if not r.get("evalTitle") and not r.get("screenshotBytes", 0):
+        return False
+    # js#31 / py#35: a stale-answer race must never surface as InvalidStateError.
+    # The guard (ignore answer when signalingState === 'stable') is expected to
+    # fire; if an InvalidStateError still escaped, the fix regressed.
+    if r.get("invalidStateError"):
         return False
     return True
 
@@ -371,7 +386,7 @@ async def main() -> None:
         ok = verdict(r)
         if not ok:
             fails += 1
-        keys = ["sessionId", "rentMs", "p2pInitialized", "cmdDcOpen", "navigateOk", "evalTitle", "clickMs", "evalMs", "sendInputLanded", "sendInputMs", "iceServersPrefetched", "screenshotBytes"]
+        keys = ["sessionId", "rentMs", "p2pInitialized", "cmdDcOpen", "navigateOk", "evalTitle", "clickMs", "evalMs", "sendInputLanded", "sendInputMs", "iceServersPrefetched", "screenshotBytes", "staleAnswerGuard", "invalidStateError"]
         print(
             f"  {'PASS' if ok else 'FAIL'} #{i} " + " ".join(
                 f"{k}={r.get(k)}" for k in keys if k in r
