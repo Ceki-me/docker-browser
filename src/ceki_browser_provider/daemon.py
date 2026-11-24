@@ -1937,9 +1937,21 @@ class ProviderWsClient:
             # resend, so dropping it leaves the P2P bridge never established.
             # take_buffer preserves append order, so match → offer → ICE arrive
             # in the order the relay delivered them.
+            #
+            # session.configure belongs here for the same reason: the renter
+            # sends it immediately after match (proxy, fingerprint, vault
+            # profile), long before the extension's presence-WS is up — the
+            # window spawn alone takes seconds. Dropping it made the proxy
+            # configuration a coin flip: configured only when the message
+            # happened to arrive after the extension connected. Measured on
+            # browser 43664: 1 of 5 rentals went out through the requested
+            # proxy, 3 leaked to the provider's own IP, 1 timed out. Buffering
+            # it means "configure before first navigation" — the contract the
+            # SDK documents — actually holds.
             if msg.get("type") in (
                 "match",
                 "cdp",
+                "session.configure",
                 "webrtc.offer",
                 "webrtc.answer",
                 "webrtc.ice_candidate",
