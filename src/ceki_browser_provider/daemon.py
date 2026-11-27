@@ -244,6 +244,11 @@ class DaemonConfig:
     local_ws_url: str = ""
     proxy: ProxySpec | None = None
     geo: ProxyGeo | None = None  # egress geo of the outbound proxy (best-effort)
+    relay_idle_timeout: float = field(
+        default_factory=lambda: float(
+            os.environ.get("CEKI_DAEMON_RELAY_IDLE_TIMEOUT", "90")
+        )
+    )
 
     @property
     def relay_url(self) -> str:
@@ -1918,6 +1923,14 @@ class ProviderWsClient:
         self._stop = False
         self._reconnect_delay = 1.0
         self._started_at = time.time()
+        # Monotonic ts of the last frame received from the relay. The relay
+        # drives heartbeats (ping every 30s), so a multi-minute silence means
+        # the socket is dead at the TCP level but no FIN/exception surfaced
+        # (half-open after a network blip / relay restart). Without this
+        # watchdog the provider would sit "online in ESTAB" forever, never
+        # reconnecting — observed on prod 43664/43665/43666/6341: silent at
+        # 12:53, relay pong-timeout at 12:55, still dead 5h later.
+        self._last_rx = time.monotonic()
 
     @property
     def relay_url(self) -> str:
@@ -2087,6 +2100,7 @@ class ProviderWsClient:
         """
         try:
             async for raw in ws:
+                self._last_rx = time.monotonic()
                 try:
                     msg = json.loads(raw)
                 except Exception:
@@ -2098,6 +2112,49 @@ class ProviderWsClient:
             raise
         finally:
             inbox.put_nowait(None)
+
+    async def _idle_watchdog(self, ws: Any) -> None:
+        """Force-close the relay socket when it goes silent for too long.
+
+        The relay drives heartbeats itself (ping every ~30s) and the client
+        disables its own keepalive (``ping_interval=None``), so the ONLY way
+        the provider notices a dead link is an inbound frame. If the TCP
+        connection half-opens (network blip, relay restart, lost FIN), no
+        frame ever arrives and no exception fires — ``_read_loop`` just sits
+        in ``async for`` forever (prod 43664/65/66/6341: silent 12:53,
+        relay pong-timeout 12:55, still offline 5h later).
+
+        TTL = 3× relay ping interval (90s by default): 3 missed heartbeats
+        is unambiguous, and no legit relay stalls that long.
+        """
+        # Floor at 0.01s: the env knob must fully control the value (prod
+        # default 90); no production deploy sets it below seconds anyway.
+        timeout = max(0.01, getattr(self.cfg, "relay_idle_timeout", 90.0))
+        try:
+            while True:
+                await asyncio.sleep(timeout)
+                idle_for = time.monotonic() - self._last_rx
+                if idle_for >= timeout:
+                    log.warning(
+                        "provider-ws: no relay message for %.0fs (>=%.0fs) — closing silent socket",
+                        idle_for, timeout,
+                    )
+                    # Graceful close can hang forever on a half-open socket
+                    # (close handshake frames never get a response), which
+                    # would keep _read_loop blocked — so force-close the
+                    # transport. abort() tears down the TCP connection
+                    # immediately; _read_loop then raises ConnectionClosed and
+                    # run() reconnects.
+                    try:
+                        ws.transport.abort()
+                    except Exception:
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                    return
+        except asyncio.CancelledError:
+            pass
 
     async def run(self) -> None:
         import time as _time
@@ -2118,6 +2175,7 @@ class ProviderWsClient:
                 ) as ws:
                     self.ws = ws
                     self._conn_started = _time.monotonic()
+                    self._last_rx = _time.monotonic()
                     log.info("provider-ws: connected %s", self.relay_url)
                     await self.send({
                         "type": "welcome",
@@ -2140,6 +2198,7 @@ class ProviderWsClient:
                     # the provider offline for the 2nd/3rd session.
                     inbox: asyncio.Queue = asyncio.Queue()
                     reader = asyncio.create_task(self._read_loop(ws, inbox))
+                    watchdog = asyncio.create_task(self._idle_watchdog(ws))
                     handlers: set[asyncio.Task] = set()
                     try:
                         while True:
@@ -2151,9 +2210,10 @@ class ProviderWsClient:
                             t.add_done_callback(handlers.discard)
                     finally:
                         reader.cancel()
+                        watchdog.cancel()
                         for t in list(handlers):
                             t.cancel()
-                        await asyncio.gather(reader, *handlers, return_exceptions=True)
+                        await asyncio.gather(reader, watchdog, *handlers, return_exceptions=True)
                         log.warning("provider-ws: relay closed the connection")
             except asyncio.CancelledError:
                 raise
